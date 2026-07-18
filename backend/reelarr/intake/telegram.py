@@ -88,8 +88,26 @@ class TelegramChannel(IntakeChannel):
 
         await self._app.initialize()
         await self._app.start()
-        await self._app.updater.start_polling()
+        # Telegram allows exactly one getUpdates consumer per bot token. Any
+        # competing call (a debug curl, a second instance, a redeploy overlap)
+        # raises Conflict and — by default — kills the polling loop for good,
+        # leaving the app "up" but deaf with no further log output. Recover
+        # instead of dying silently.
+        await self._app.updater.start_polling(error_callback=self._on_polling_error)
         logger.info("telegram channel started (long polling)")
+
+    def _on_polling_error(self, exc: Exception) -> None:
+        """Log polling errors loudly; PTB retries the loop rather than exiting."""
+        from telegram.error import Conflict
+
+        if isinstance(exc, Conflict):
+            logger.error(
+                "telegram polling conflict — another getUpdates consumer is using "
+                "this bot token (a second Reelarr instance, or a manual API call). "
+                "Retrying; if this repeats, make sure only one instance is running."
+            )
+        else:
+            logger.error("telegram polling error: %s: %s", type(exc).__name__, exc)
 
     async def stop(self) -> None:
         if self._app is not None:

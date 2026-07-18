@@ -10,7 +10,7 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from reelarr.ai.openai_compat import (
     OpenAICompatSttClient,
@@ -215,6 +215,11 @@ def create_app() -> FastAPI:
 
         @app.get("/{full_path:path}", include_in_schema=False)
         async def spa_fallback(full_path: str):
+            # Never swallow unmatched API paths — returning index.html for a
+            # typo'd/removed endpoint makes clients parse HTML as JSON and get a
+            # baffling error instead of a clean 404.
+            if full_path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="Not found")
             candidate = dist / full_path
             if full_path and candidate.is_file():
                 return FileResponse(candidate)
