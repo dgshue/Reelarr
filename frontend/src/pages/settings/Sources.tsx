@@ -37,6 +37,7 @@ const CHANNELS = [
     ],
     allowlistLabel: "Allowed Channel IDs (comma-separated)",
     advanced: false,
+    comingSoon: true,
   },
   {
     type: "whatsapp",
@@ -52,6 +53,7 @@ const CHANNELS = [
     ],
     allowlistLabel: "Allowed Phone Numbers (comma-separated)",
     advanced: true,
+    comingSoon: true,
   },
 ];
 
@@ -68,13 +70,19 @@ export default function Sources() {
         <div className="panel" key={ch.type}>
           <h2>
             <i className={`fa-solid ${ch.icon}`} /> {ch.name}{" "}
-            {ch.advanced && <span className="status-pill warning">advanced</span>}
+            {ch.comingSoon && <span className="status-pill info">coming soon</span>}
+            {!ch.comingSoon && ch.advanced && <span className="status-pill warning">advanced</span>}
           </h2>
-          <p className="form-hint" style={{ margin: "0 0 12px" }}>{ch.note}</p>
+          <p className="form-hint" style={{ margin: "0 0 12px" }}>
+            {ch.comingSoon
+              ? "Not wired up yet — the adapter and settings UI are on the roadmap. Fields below are disabled for now."
+              : ch.note}
+          </p>
           {ch.fields.map((f) => (
             <div className="form-row" key={f.key}>
               <label>{f.label}</label>
               <input
+                disabled={ch.comingSoon}
                 value={configs[ch.type]?.[f.key] ?? ""}
                 onChange={(e) => setField(ch.type, f.key, e.target.value)}
               />
@@ -83,11 +91,18 @@ export default function Sources() {
           <div className="form-row">
             <label>{ch.allowlistLabel}</label>
             <input
+              disabled={ch.comingSoon}
               value={configs[ch.type]?.allowlist ?? ""}
               onChange={(e) => setField(ch.type, "allowlist", e.target.value)}
             />
           </div>
-          <TestButton endpoint={`${API}/settings/sources/${ch.type}/test`} payload={() => ({ config: configs[ch.type] ?? {} })} />
+          {ch.comingSoon ? (
+            <button className="btn" disabled>
+              Coming soon
+            </button>
+          ) : (
+            <TestButton endpoint={`${API}/settings/sources/${ch.type}/test`} payload={() => ({ config: configs[ch.type] ?? {} })} />
+          )}
           {/* TODO: persist via PUT /settings/sources/channels/{type} and show
               live-populated guild/channel dropdowns from the Test payload. */}
         </div>
