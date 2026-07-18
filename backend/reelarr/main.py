@@ -81,7 +81,8 @@ def _build_processor(cfg) -> tuple[RequestProcessor | None, dict[str, IntakeChan
         return None, {}
 
     resolver = YtDlpResolver(
-        cfg.tmp_dir, cfg.cookies_dir, cfg.max_video_height, cfg.max_video_minutes
+        cfg.tmp_dir, cfg.cookies_dir, cfg.max_video_height, cfg.max_video_minutes,
+        frame_width=cfg.frame_width,
     )
     text_llm = OpenAICompatTextClient(cfg.litellm_base_url, cfg.text_model, cfg.litellm_api_key)
     vision_llm = OpenAICompatVisionClient(

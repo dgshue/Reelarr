@@ -93,7 +93,11 @@ class AppConfig(BaseSettings):
     # --- Pipeline limits ---
     max_video_minutes: int = 5
     max_video_height: int = 720
-    frame_count: int = 4
+    frame_count: int = 6
+    # Frames are downscaled before the vision call: ~1000 vision tokens per
+    # frame at 512px vs ~2000 at full resolution (which overflows Ollama's
+    # default 4096 context). Subtitles stay legible at 512.
+    frame_width: int = 512
 
     @property
     def sqlalchemy_url(self) -> str:

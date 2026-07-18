@@ -4,7 +4,7 @@ import pytest
 
 from reelarr.pipeline.identify import IdentificationPipeline, PipelineOutcome
 from reelarr.pipeline.media import ClipMetadata
-from reelarr.pipeline.tmdb import TmdbMatch
+from reelarr.pipeline.tmdb import PersonCredit, TmdbMatch
 
 from tests.conftest import FakeResolver, FakeStt, FakeTextLLM, FakeTmdb, FakeVisionLLM
 
@@ -62,25 +62,205 @@ async def test_tier2_transcript_used_when_tier1_low_confidence():
     assert "AUDIO TRANSCRIPT:" in text_llm.calls[1][1]
 
 
-async def test_tier3_frames_only_when_vision_enabled():
-    text_llm = FakeTextLLM({"title": None, "confidence": "low"})
-    vision = FakeVisionLLM({"title": "Heat", "year": 1995, "type": "movie", "confidence": "high"})
-    stt = FakeStt("")  # empty transcript -> tier 2 yields nothing
+def make_tier3_pipeline(**kwargs):
+    """Pipeline where tiers 1-2 fail and tier 3 evidence points at Heat (1995).
 
+    Vision OCRs subtitles naming Neil + Vincent and recognizes De Niro +
+    Pacino; TMDB filmography intersection surfaces Heat; credit verification
+    finds both character names -> verified high.
+    """
+    defaults = dict(
+        resolver=FakeResolver(
+            metadata=ClipMetadata(platform="tiktok", description="#movie #fyp"),
+            frames=["ZmFrZS1qcGVn", "ZnJhbWUy"],
+        ),
+        text_llm=FakeTextLLM(
+            {"title": None, "confidence": "low"},  # tier 1
+            {   # tier 3 evidence call
+                "candidates": [
+                    {"title": "Heat", "year": 1995, "type": "movie", "confidence": "medium"}
+                ],
+                "character_names": ["Neil", "Vincent"],
+            },
+        ),
+        stt=FakeStt(""),  # empty transcript -> tier 2 yields nothing
+        tmdb=FakeTmdb(
+            matches=[HEAT],
+            person_ids={"Robert De Niro": 380, "Al Pacino": 1158},
+            person_credits={
+                380: [PersonCredit("movie", 949, "Heat", 1995, 9.0, "Neil McCauley")],
+                1158: [PersonCredit("movie", 949, "Heat", 1995, 10.0, "Vincent Hanna")],
+            },
+            cast_characters={("movie", 949): ["Neil McCauley", "Vincent Hanna"]},
+        ),
+        vision_llm=FakeVisionLLM(
+            describe_response=(
+                "ON-SCREEN TEXT: 'Neil, what do you say?' / 'Vincent, drop the gun.' "
+                "— English subtitles."
+            ),
+            actor_response={
+                "actors": [
+                    {"name": "Robert De Niro", "confidence": "likely"},
+                    {"name": "Al Pacino", "confidence": "likely"},
+                ]
+            },
+        ),
+        enable_vision=True,
+    )
+    defaults.update(kwargs)
+    return IdentificationPipeline(**defaults)
+
+
+async def test_tier3_frames_only_when_vision_enabled():
     # Vision disabled -> unidentified, frames never extracted
-    p1 = make_pipeline(text_llm=text_llm, stt=stt, vision_llm=vision, enable_vision=False)
+    p1 = make_tier3_pipeline(enable_vision=False)
     r1 = await p1.run(URL)
     assert r1.outcome == PipelineOutcome.UNIDENTIFIED
     assert "frames" not in p1.resolver.calls
 
     # Vision enabled -> tier 3 resolves it
-    text_llm2 = FakeTextLLM({"title": None, "confidence": "low"})
-    p2 = make_pipeline(text_llm=text_llm2, stt=stt, vision_llm=vision, enable_vision=True)
+    p2 = make_tier3_pipeline()
     r2 = await p2.run(URL)
     assert r2.outcome == PipelineOutcome.AUTO_ADD
     assert r2.resolved_tier == "frames"
     assert "frames" in p2.resolver.calls
-    assert vision.calls  # vision LLM actually invoked
+    assert p2.vision_llm.calls  # vision LLM actually invoked
+
+
+async def test_tier3_verified_match_pins_exact_tmdb_entry():
+    pipeline = make_tier3_pipeline()
+    result = await pipeline.run(URL)
+    assert result.outcome == PipelineOutcome.AUTO_ADD
+    assert result.identification.confidence == "high"
+    assert result.match.tmdb_id == 949  # from credit verification, not re-search
+    # Both kinds of vision calls happened: describe chunk(s) + per-frame actor calls
+    systems = [c[0] for c in pipeline.vision_llm.calls]
+    assert any("describe" in s.lower() for s in systems)
+    assert any("actors" in s.lower() for s in systems)
+    # Actor recognition is one frame per call (batching degrades accuracy)
+    actor_calls = [c for c in pipeline.vision_llm.calls if "actors" in c[0].lower()]
+    assert all(len(c[2]) == 1 for c in actor_calls)
+
+
+async def test_tier3_contradicted_candidate_demoted_to_low():
+    """Character names present but no candidate's credits contain them ->
+    the LLM's title guess must NOT auto-add, however confident it claims to be."""
+    pipeline = make_tier3_pipeline(
+        text_llm=FakeTextLLM(
+            {"title": None, "confidence": "low"},
+            {   # LLM claims high confidence on a wrong title
+                "candidates": [
+                    {"title": "Heat", "year": 1995, "type": "movie", "confidence": "high"}
+                ],
+                "character_names": ["Tripp", "Jeffrey"],
+            },
+        ),
+        tmdb=FakeTmdb(
+            matches=[HEAT],
+            person_ids={"Robert De Niro": 380, "Al Pacino": 1158},
+            person_credits={
+                380: [PersonCredit("movie", 949, "Heat", 1995, 9.0, "Neil McCauley")],
+                1158: [PersonCredit("movie", 949, "Heat", 1995, 10.0, "Vincent Hanna")],
+            },
+            cast_characters={("movie", 949): ["Neil McCauley", "Vincent Hanna"]},
+        ),
+        vision_llm=FakeVisionLLM(
+            describe_response=(
+                "ON-SCREEN TEXT: 'Amy is Tripp's first love' / "
+                "'Jeffrey is not Tripp's nephew' — English subtitles."
+            ),
+            actor_response={
+                "actors": [
+                    {"name": "Robert De Niro", "confidence": "likely"},
+                    {"name": "Al Pacino", "confidence": "likely"},
+                ]
+            },
+        ),
+    )
+    result = await pipeline.run(URL)
+    assert result.outcome != PipelineOutcome.AUTO_ADD
+    assert result.identification.confidence == "low"
+
+
+async def test_tier3_unverifiable_candidate_capped_at_medium():
+    """No character names extracted -> nothing to verify against -> a bare
+    LLM guess is capped at medium so it goes to confirmation, never auto-add."""
+    pipeline = make_tier3_pipeline(
+        text_llm=FakeTextLLM(
+            {"title": None, "confidence": "low"},
+            {
+                "candidates": [
+                    {"title": "Heat", "year": 1995, "type": "movie", "confidence": "high"}
+                ],
+                "character_names": [],
+            },
+        ),
+        vision_llm=FakeVisionLLM(
+            describe_response="Two men talking in a diner. No on-screen text.",
+            actor_response={"actors": []},
+        ),
+    )
+    result = await pipeline.run(URL)
+    assert result.outcome == PipelineOutcome.NEEDS_CONFIRMATION
+    assert result.identification.confidence == "medium"
+    assert result.resolved_tier == "frames"
+
+
+async def test_tier3_ungrounded_character_names_cannot_self_verify():
+    """The LLM proposes 'Heat' AND claims character names that do not occur
+    anywhere in the evidence (hallucinated to fit its own guess). The
+    grounding guard must discard them, leaving nothing to verify -> capped at
+    medium, never a verified high."""
+    pipeline = make_tier3_pipeline(
+        text_llm=FakeTextLLM(
+            {"title": None, "confidence": "low"},
+            {
+                "candidates": [
+                    {"title": "Heat", "year": 1995, "type": "movie", "confidence": "high"}
+                ],
+                # Correct characters for Heat — but absent from the evidence.
+                "character_names": ["Neil", "Vincent"],
+            },
+        ),
+        vision_llm=FakeVisionLLM(
+            describe_response="Two men in a diner. No on-screen text.",
+            actor_response={"actors": []},
+        ),
+    )
+    result = await pipeline.run(URL)
+    assert result.outcome == PipelineOutcome.NEEDS_CONFIRMATION
+    assert result.identification.confidence == "medium"
+    # Verification never ran: no credit lookups were made
+    assert pipeline.tmdb.credit_lookups == []
+
+
+def test_character_hits_prefix_tolerance():
+    hits = IdentificationPipeline._character_hits
+    # STT drift: "Trip" (heard) matches credited "Tripp"
+    assert hits(["Trip", "Ace"], ["Tripp", "Paula", "Ace Goldberg", "Kit"]) == 2
+    # Nickname prefix: "Jeff" matches "Jeffrey"
+    assert hits(["Jeff"], ["Jeffrey"]) == 1
+    # Short names must match exactly (no "Al" ~ "Alan")
+    assert hits(["Al"], ["Alan"]) == 0
+    assert hits(["Al"], ["Al"]) == 1
+    # Multi-word names require every word
+    assert hits(["Neil McCauley"], ["Neil McCauley"]) == 1
+    assert hits(["Neil Diamond"], ["Neil McCauley"]) == 0
+
+
+async def test_tier3_garbage_evidence_stays_unidentified():
+    pipeline = make_tier3_pipeline(
+        text_llm=FakeTextLLM(
+            {"title": None, "confidence": "low"},
+            "definitely not json",
+        ),
+        vision_llm=FakeVisionLLM(
+            describe_response="A blurry frame.",
+            actor_response="also not json",
+        ),
+    )
+    result = await pipeline.run(URL)
+    assert result.outcome == PipelineOutcome.UNIDENTIFIED
 
 
 async def test_tier2_stt_failure_degrades_gracefully():

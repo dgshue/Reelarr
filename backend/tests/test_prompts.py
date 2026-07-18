@@ -2,7 +2,10 @@
 
 from reelarr.pipeline.prompts import (
     IDENTIFICATION_SYSTEM_PROMPT,
+    build_evidence_content,
     build_user_content,
+    parse_actor_guesses,
+    parse_evidence_identification,
     parse_identification,
 )
 
@@ -75,3 +78,82 @@ def test_build_user_content_labels_sections():
 
 def test_build_user_content_empty():
     assert "(no metadata available)" in build_user_content()
+
+
+# --- Tier 3: actor-guess parsing ---------------------------------------------
+
+
+def test_parse_actor_guesses_clean_and_fenced():
+    raw = '{"actors": [{"name": "Bradley Cooper", "confidence": "likely"}]}'
+    assert parse_actor_guesses(raw) == ["Bradley Cooper"]
+    fenced = '```json\n{"actors": [{"name": "Zooey Deschanel", "confidence": "certain"}]}\n```'
+    assert parse_actor_guesses(fenced) == ["Zooey Deschanel"]
+
+
+def test_parse_actor_guesses_filters_unsure_and_garbage():
+    raw = (
+        '{"actors": [{"name": "A", "confidence": "unsure"}, {"name": "", "confidence": "likely"},'
+        ' {"confidence": "likely"}, {"name": "B", "confidence": "likely"}, "junk"]}'
+    )
+    assert parse_actor_guesses(raw) == ["B"]
+    assert parse_actor_guesses(raw, include_unsure=True) == ["A", "B"]
+    for bad in ("", "not json", '{"actors": "nope"}', "[]"):
+        assert parse_actor_guesses(bad) == []
+
+
+# --- Tier 3: evidence identification parsing -----------------------------------
+
+
+def test_parse_evidence_identification_full():
+    raw = (
+        '{"candidates": [{"title": "Failure to Launch", "year": 2006, "type": "movie",'
+        ' "confidence": "medium"}], "character_names": ["Tripp\'s", "Ace", "Ace"]}'
+    )
+    candidates, names = parse_evidence_identification(raw)
+    assert candidates[0].title == "Failure to Launch"
+    assert candidates[0].year == 2006
+    assert names == ["Tripp", "Ace"]  # possessive stripped, deduped
+
+
+def test_parse_evidence_identification_strips_think_block():
+    raw = (
+        "<think>The subtitles mention Tripp... hmm {not json}</think>\n"
+        '{"candidates": [], "character_names": ["Tripp"]}'
+    )
+    candidates, names = parse_evidence_identification(raw)
+    assert candidates == []
+    assert names == ["Tripp"]
+
+
+def test_parse_evidence_identification_garbage_is_safe():
+    for raw in ("", "not json", '{"candidates": "x", "character_names": 3}', "null"):
+        candidates, names = parse_evidence_identification(raw)
+        assert candidates == []
+        assert names == []
+
+
+def test_parse_evidence_identification_caps_candidates_and_drops_unknown():
+    raw = (
+        '{"candidates": ['
+        '{"title": "A", "type": "movie", "confidence": "low"},'
+        '{"title": null, "type": "movie", "confidence": "high"},'
+        '{"title": "B", "type": "tv", "confidence": "low"},'
+        '{"title": "C", "type": "movie", "confidence": "low"},'
+        '{"title": "D", "type": "movie", "confidence": "low"}],'
+        ' "character_names": []}'
+    )
+    candidates, _ = parse_evidence_identification(raw)
+    assert [c.title for c in candidates] == ["A", "B", "C"]
+
+
+def test_build_evidence_content_labels_sections():
+    content = build_evidence_content(
+        caption="#movie #fyp",
+        transcript="Ace told me everything.",
+        frame_descriptions=["ON-SCREEN TEXT: Amy is Tripp's first love", "  "],
+    )
+    assert "CAPTION:" in content
+    assert "AUDIO TRANSCRIPT:" in content
+    assert "VISUAL DESCRIPTION OF FRAMES" in content
+    assert "Tripp's first love" in content
+    assert build_evidence_content() == "(no evidence available)"

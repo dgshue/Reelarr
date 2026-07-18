@@ -65,12 +65,32 @@ class FakeTextLLM:
 
 
 class FakeVisionLLM:
-    def __init__(self, response: dict | str = "{}") -> None:
+    """Routes by prompt: describe calls and actor calls get separate responses.
+
+    Tier 3 makes two kinds of vision calls (frame description + per-frame
+    actor recognition), distinguished by their system prompt.
+    """
+
+    def __init__(
+        self,
+        response: dict | str = "{}",
+        describe_response: str | None = None,
+        actor_response: dict | str | None = None,
+    ) -> None:
         self.response = response if isinstance(response, str) else json.dumps(response)
+        self.describe_response = describe_response
+        self.actor_response = (
+            actor_response if isinstance(actor_response, str | None)
+            else json.dumps(actor_response)
+        )
         self.calls: list[tuple[str, str, list[str]]] = []
 
     async def complete_with_images(self, system: str, user: str, images_b64: list[str]) -> str:
         self.calls.append((system, user, images_b64))
+        if self.actor_response is not None and "actors" in system.lower():
+            return self.actor_response
+        if self.describe_response is not None and "describe" in system.lower():
+            return self.describe_response
         return self.response
 
 
@@ -86,12 +106,23 @@ class FakeStt:
 
 
 class FakeTmdb:
-    """TmdbClient fake returning scripted matches."""
+    """TmdbClient fake returning scripted matches (+ Tier 3 person/credit data)."""
 
-    def __init__(self, matches: list | None = None, tvdb_ids: dict[int, int] | None = None) -> None:
+    def __init__(
+        self,
+        matches: list | None = None,
+        tvdb_ids: dict[int, int] | None = None,
+        person_ids: dict[str, int] | None = None,
+        person_credits: dict[int, list] | None = None,  # person_id -> [PersonCredit]
+        cast_characters: dict[tuple[str, int], list[str]] | None = None,
+    ) -> None:
         self.matches = matches or []
         self.tvdb_ids = tvdb_ids or {}
+        self.person_ids = person_ids or {}
+        self.person_credits = person_credits or {}
+        self.cast_characters = cast_characters or {}
         self.searches: list[tuple[str, int | None]] = []
+        self.credit_lookups: list[tuple[str, int]] = []
 
     async def search_multi(self, query: str, year: int | None = None):
         self.searches.append((query, year))
@@ -99,6 +130,16 @@ class FakeTmdb:
 
     async def resolve_tvdb_id(self, tmdb_id: int) -> int | None:
         return self.tvdb_ids.get(tmdb_id)
+
+    async def search_person(self, name: str) -> int | None:
+        return self.person_ids.get(name)
+
+    async def combined_credits(self, person_id: int):
+        return list(self.person_credits.get(person_id, []))
+
+    async def top_cast_characters(self, media_type: str, tmdb_id: int, limit: int = 25):
+        self.credit_lookups.append((media_type, tmdb_id))
+        return list(self.cast_characters.get((media_type, tmdb_id), []))
 
 
 @pytest.fixture

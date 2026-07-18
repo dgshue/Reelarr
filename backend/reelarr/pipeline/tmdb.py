@@ -21,6 +21,24 @@ class TmdbMatch:
     overview: str | None = None
 
 
+@dataclass
+class PersonCredit:
+    """One acting credit from a person's combined credits (Tier 3 evidence)."""
+
+    media_type: str  # "movie" | "tv"
+    tmdb_id: int
+    title: str
+    year: int | None
+    popularity: float
+    character: str
+
+
+def _is_self_appearance(character: str | None) -> bool:
+    """Talk shows / awards / archive footage credit the person as 'Self'."""
+    c = (character or "").lower()
+    return not c or "self" in c or "himself" in c or "herself" in c or "archive" in c
+
+
 class TmdbClient:
     def __init__(self, api_key: str, client: httpx.AsyncClient | None = None) -> None:
         self.api_key = api_key
@@ -60,6 +78,56 @@ class TmdbClient:
             # Stable sort: matches for the identified year float to the top.
             matches.sort(key=lambda m: 0 if m.year == year else 1)
         return matches
+
+    async def search_person(self, name: str) -> int | None:
+        """Best-match person id for an actor name, or None."""
+        resp = await self._client.get(
+            f"{TMDB_BASE}/search/person",
+            params={"api_key": self.api_key, "query": name, "include_adult": "false"},
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        return results[0]["id"] if results else None
+
+    async def combined_credits(self, person_id: int) -> list[PersonCredit]:
+        """Acting credits for a person, excluding self-appearances (talk shows)."""
+        resp = await self._client.get(
+            f"{TMDB_BASE}/person/{person_id}/combined_credits",
+            params={"api_key": self.api_key},
+        )
+        resp.raise_for_status()
+        credits: list[PersonCredit] = []
+        for item in resp.json().get("cast", []):
+            media_type = item.get("media_type")
+            if media_type not in ("movie", "tv"):
+                continue
+            if _is_self_appearance(item.get("character")):
+                continue
+            date = item.get("release_date") or item.get("first_air_date") or ""
+            year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
+            credits.append(
+                PersonCredit(
+                    media_type=media_type,
+                    tmdb_id=item["id"],
+                    title=item.get("title") or item.get("name") or "",
+                    year=year,
+                    popularity=item.get("popularity") or 0.0,
+                    character=item.get("character") or "",
+                )
+            )
+        return credits
+
+    async def top_cast_characters(
+        self, media_type: str, tmdb_id: int, limit: int = 25
+    ) -> list[str]:
+        """Character names of the top-billed cast (Tier 3 verification)."""
+        kind = "movie" if media_type == "movie" else "tv"
+        resp = await self._client.get(
+            f"{TMDB_BASE}/{kind}/{tmdb_id}/credits", params={"api_key": self.api_key}
+        )
+        resp.raise_for_status()
+        cast = resp.json().get("cast", [])[:limit]
+        return [c.get("character") or "" for c in cast]
 
     async def resolve_tvdb_id(self, tmdb_id: int) -> int | None:
         """TMDB external IDs endpoint — Sonarr requires tvdbId."""

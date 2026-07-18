@@ -224,7 +224,15 @@ could bypass LiteLLM later if ever needed, without a rewrite.
 **Identification pipeline** — unchanged from the original spec:
 1. **Tier 1 (metadata)**: yt-dlp metadata (caption, hashtags, top comments) → text LLM
 2. **Tier 2 (transcript)**: if UNKNOWN or confidence < high → ffmpeg audio extraction → STT → re-prompt with transcript + metadata
-3. **Tier 3 (frames, feature-flagged)**: if still unresolved and `ENABLE_VISION=true` → extract N evenly-spaced frames → vision LLM
+3. **Tier 3 (frames, feature-flagged)**: if still unresolved and `ENABLE_VISION=true` → extract
+   scene-change frames (downscaled; evenly-spaced fallback) → vision LLM gathers *evidence*
+   (burned-in subtitle OCR, per-frame actor recognition, scene description) → text LLM proposes
+   candidates + character names → candidates verified against TMDB credits (actor-pair filmography
+   intersection + character-name overlap). Only credit-verified results get high confidence;
+   unverifiable LLM guesses are capped at medium so they can never silently auto-add. (Empirically,
+   local vision models OCR subtitles near-perfectly and recognize actors in close-ups, but
+   hallucinate when asked to name the title directly — hence evidence + verification, not "what
+   movie is this?")
 4. TMDB `/search/multi` lookup (+ TVDB external-ID resolution for TV, since Sonarr needs `tvdbId`)
 5. **Identification-confidence gate**: high + single exact match → proceed straight to fulfillment; otherwise → confirmation prompt (inline buttons or numbered reply, per §4) on the originating channel with the top 3 matches + "None of these" — this gate answers "is this the right title," independent of §5.5's fulfillment gate
 6. **Fulfillment** — see §5.5, routes to either Radarr/Sonarr directly or Overseerr/Jellyseerr for approval

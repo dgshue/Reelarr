@@ -43,7 +43,8 @@ class IdentificationSettings(BaseModel):
     stt_base_url: str = ""
     stt_api_key: str = ""
     enable_vision: bool = False
-    frame_count: int = 4
+    frame_count: int = 6
+    frame_width: int = 512
     max_video_minutes: int = 5
     max_video_height: int = 720
 
@@ -122,6 +123,7 @@ def _env_defaults(section: str) -> dict:
             stt_api_key=cfg.stt_api_key,
             enable_vision=cfg.enable_vision,
             frame_count=cfg.frame_count,
+            frame_width=cfg.frame_width,
             max_video_minutes=cfg.max_video_minutes,
             max_video_height=cfg.max_video_height,
         ).model_dump()

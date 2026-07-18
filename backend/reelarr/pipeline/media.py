@@ -4,7 +4,11 @@ Mirrors the original media-resolver API contract:
 - metadata:   yt-dlp --dump-json --no-download --write-comments (comments best-effort)
 - transcript: download (cap 720p / ~5 min) -> ffmpeg audio extraction (STT happens
               upstream via SttClient — this layer only produces the audio file)
-- frames:     N evenly-spaced frames as base64 JPEGs
+- frames:     scene-change frames (fallback: evenly spaced), downscaled, as
+              base64 JPEGs. Downscaling matters: full-resolution frames cost
+              ~2000 vision tokens each and overflow Ollama's default 4096
+              context; at 512px wide they cost ~1000 each. The first/last few
+              seconds are skipped (intros, outros, end cards).
 
 Supports a cookies file at <cookies_dir>/<platform>.txt when present (needed
 for Instagram; TikTok must work without cookies).
@@ -21,6 +25,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 from urllib.parse import urlparse
+
+# --- Frame extraction tuning (Tier 3) ----------------------------------------
+SCENE_THRESHOLD = 0.3   # ffmpeg select=gt(scene,X) — fraction of pixels changed
+EDGE_SKIP_SECONDS = 3.0  # skip intro/outro (title cards, end cards, black)
+MAX_SCENE_FRAMES = 24    # hard cap on scene-change frames per clip
+
+
+def _evenly_subsample(items: list, count: int) -> list:
+    """Pick `count` items spread evenly across the list (keeps first + last)."""
+    if count <= 0 or len(items) <= count:
+        return list(items)
+    if count == 1:
+        return [items[0]]
+    idx = [round(i * (len(items) - 1) / (count - 1)) for i in range(count)]
+    return [items[i] for i in dict.fromkeys(idx)]
+
 
 SUPPORTED_URL_PATTERNS = (
     "instagram.com",
@@ -80,12 +100,14 @@ class YtDlpResolver:
     """
 
     def __init__(self, tmp_dir: Path, cookies_dir: Path, max_height: int = 720,
-                 max_minutes: int = 5, timeout: float = 120.0) -> None:
+                 max_minutes: int = 5, timeout: float = 120.0,
+                 frame_width: int = 512) -> None:
         self.tmp_dir = tmp_dir
         self.cookies_dir = cookies_dir
         self.max_height = max_height
         self.max_minutes = max_minutes
         self.timeout = timeout
+        self.frame_width = frame_width
         self._downloads: dict[str, Path] = {}  # url -> workdir (per-request cache)
 
     # --- internals -------------------------------------------------------
@@ -185,20 +207,42 @@ class YtDlpResolver:
         workdir = await self._ensure_download(url)
         video = self._video_file(workdir)
 
-        # Probe duration for even spacing.
+        # Probe duration for the edge-skip window and even-spacing fallback.
         code, out, _err = await self._run(
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", str(video),
         )
         duration = float(out.strip()) if code == 0 and out.strip() else 60.0
+        skip = EDGE_SKIP_SECONDS if duration > 4 * EDGE_SKIP_SECONDS else 0.0
+        start, end = skip, max(duration - skip, skip + 1.0)
+        scale = f"scale={self.frame_width}:-2"
 
+        # Preferred: scene-change detection — evenly-spaced sampling lands on
+        # transitions/black frames and misses short scenes; scene cuts track
+        # the actual shot structure of the clip.
+        scene_dir = workdir / "scene_frames"
+        scene_dir.mkdir(exist_ok=True)
+        code, _out, _err = await self._run(
+            "ffmpeg", "-y", "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
+            "-i", str(video),
+            "-vf", f"select='gt(scene,{SCENE_THRESHOLD})',{scale}",
+            "-fps_mode", "vfr", "-frames:v", str(MAX_SCENE_FRAMES),
+            "-q:v", "3", str(scene_dir / "scene_%03d.jpg"),
+        )
+        scene_files = sorted(scene_dir.glob("scene_*.jpg")) if code == 0 else []
+        if len(scene_files) >= 2:
+            picked = _evenly_subsample(scene_files, count)
+            return [base64.b64encode(f.read_bytes()).decode() for f in picked]
+
+        # Fallback: evenly-spaced frames inside the trimmed window (static
+        # clips, single-shot videos, or scene detection failure).
         frames: list[str] = []
         for i in range(count):
-            ts = duration * (i + 0.5) / count
+            ts = start + (end - start) * (i + 0.5) / count
             frame_path = workdir / f"frame_{i}.jpg"
             code, _out, err = await self._run(
                 "ffmpeg", "-y", "-ss", f"{ts:.2f}", "-i", str(video),
-                "-frames:v", "1", "-q:v", "3", str(frame_path),
+                "-frames:v", "1", "-vf", scale, "-q:v", "3", str(frame_path),
             )
             if code != 0:
                 raise RuntimeError(f"ffmpeg frame extraction failed: {err.strip()[-500:]}")
