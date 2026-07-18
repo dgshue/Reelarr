@@ -13,10 +13,17 @@ model_list:
       api_base: http://ollama-nvidia:11434
 
   # --- Local vision, Tier 3 fallback (feature-flagged via ENABLE_VISION) ---
+  # IMPORTANT: routed through Ollama's OpenAI-compatible /v1 endpoint (openai/
+  # prefix), NOT the ollama/ prefix. LiteLLM's ollama/ image handling requires
+  # Pillow, which the litellm Docker image does not ship — every vision call
+  # 500s with "ollama image conversion failed please run `pip install Pillow`".
+  # The openai/ passthrough forwards image_url content blocks verbatim and
+  # Ollama decodes the base64 data URIs natively.
   - model_name: reelarr-vision
     litellm_params:
-      model: ollama/qwen2.5vl:7b
-      api_base: http://ollama-nvidia:11434
+      model: openai/qwen2.5vl:7b
+      api_base: http://ollama-nvidia:11434/v1
+      api_key: "not-needed"
 
   # --- Local STT (Speaches — already deployed, OpenAI-compatible) ---
   # Model name must match a model pulled on the Speaches instance.

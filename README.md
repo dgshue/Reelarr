@@ -14,7 +14,8 @@ Commercial providers (Groq, Gemini) are optional per-component drop-ins.
 Telegram/Discord/Slack/WhatsApp ──> IntakeChannel ──> Identification pipeline
                                                         1. yt-dlp metadata  -> text LLM
                                                         2. audio -> STT     -> text LLM
-                                                        3. frames           -> vision LLM (opt-in)
+                                                        3. frames -> vision LLM (OCR + actor
+                                                           evidence) -> TMDB credit verification
                                                         4. TMDB lookup (+ TVDB id for TV)
                                                         5. confidence gate ──> confirm on channel
                                                         6. fulfillment ──> Radarr/Sonarr direct
@@ -74,6 +75,13 @@ instance at `http://ollama-speaches:8000/v1` with model
 `Systran/faster-distil-whisper-small.en`. Any OpenAI-compatible STT endpoint works — change the
 `reelarr-stt` entry in `deploy/litellm-config.yaml`, or set `STT_BASE_URL` to bypass LiteLLM
 entirely.
+
+> **The model must actually be installed on the Speaches instance** or every Tier 2 call 404s:
+> `curl -X POST http://ollama-speaches:8000/v1/models/Systran/faster-distil-whisper-small.en`.
+> If that download itself fails with a `PermissionError` on `/home/ubuntu/.cache/huggingface`,
+> the container's HF cache volume is owned by the wrong UID — fix ownership on the host.
+> Note the default model is **English-only** (`.en`); for clips with non-English dialogue swap in
+> a multilingual model such as `Systran/faster-whisper-small`.
 
 ### 3. LiteLLM proxy
 
