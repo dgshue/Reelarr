@@ -7,6 +7,7 @@ In Docker:    CMD in the image runs the same thing.
 from __future__ import annotations
 
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -30,6 +31,25 @@ from reelarr.pipeline.tmdb import TmdbClient
 from reelarr.services.processor import RequestProcessor
 
 logger = logging.getLogger("reelarr")
+
+
+def _configure_logging(level: str) -> None:
+    """Attach the app's logger to stdout at the configured level.
+
+    Without this, uvicorn only configures its *own* loggers, so everything
+    Reelarr logs — including swallowed intake-channel startup failures — goes
+    nowhere, which makes "the bot silently isn't running" undiagnosable.
+    """
+    reelarr_logger = logging.getLogger("reelarr")
+    if reelarr_logger.handlers:  # already configured (e.g. reload)
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")
+    )
+    reelarr_logger.addHandler(handler)
+    reelarr_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    reelarr_logger.propagate = False
 
 
 def _build_processor(cfg) -> tuple[RequestProcessor | None, dict[str, IntakeChannel]]:
@@ -114,11 +134,17 @@ def _build_processor(cfg) -> tuple[RequestProcessor | None, dict[str, IntakeChan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = get_config()
+    _configure_logging(cfg.log_level)
     init_db()
     processor, channels = _build_processor(cfg)
     app.state.processor = processor
     app.state.channels = channels
     app.state.whatsapp_channel = channels.get("whatsapp")
+    if not channels:
+        logger.warning(
+            "no intake channels configured — set TELEGRAM_BOT_TOKEN (or another "
+            "Source) or Reelarr has no way to receive links"
+        )
     for name, channel in channels.items():
         try:
             await channel.start()
