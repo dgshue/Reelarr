@@ -12,6 +12,12 @@
 #
 # Prereq on the host: /nvme0/appdata/reelarr/litellm-config.yaml
 # (copy from this repo's deploy/litellm-config.yaml).
+#
+# NOTE — why absolute host paths, not relative ones: when Portainer deploys a
+# git-based stack it clones into its own /data volume, so a relative bind mount
+# like ./deploy/litellm-config.yaml resolves to a path the Docker daemon can't
+# see on the host, and Docker silently creates a *directory* there instead of
+# mounting the file. Bind mounts in this file must always be absolute host paths.
 
 version: "3.8"
 
@@ -21,8 +27,13 @@ networks:
 
 services:
   reelarr:
-    image: dgshue/reelarr:latest
-    pull_policy: always
+    image: ${REELARR_IMAGE:-dgshue/reelarr:latest}
+    # Builds from the repo when the published image doesn't exist yet. Once
+    # dgshue/reelarr:latest is on Docker Hub, drop `build:` and restore
+    # `pull_policy: always` so Watchtower keeps it updated.
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: reelarr
     restart: unless-stopped
     networks:
