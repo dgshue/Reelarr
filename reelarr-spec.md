@@ -230,7 +230,60 @@ could bypass LiteLLM later if ever needed, without a rewrite.
 6. **Fulfillment** — see §5.5, routes to either Radarr/Sonarr directly or Overseerr/Jellyseerr for approval
 
 System prompt, JSON contract, and defensive parsing carry forward unchanged from
-`media-share-pipeline-spec.md` §"LLM identification prompt."
+`media-share-pipeline-spec.md` §"LLM identification prompt", except for the
+multi-title extension in §5.4.
+
+### 5.4 Multi-title clips (listicles / "top 10" posts)
+
+A large share of film-related social content isn't one clip from one film — it's
+a countdown ("5 mind-bending movies you need to watch", "top 10 horror films of
+the decade"), a versus post, or a slideshow. These are arguably the *highest*
+value content type for Reelarr, since one shared link can become several library
+adds. Measured behavior of the original single-title contract on these (real
+qwen3:8b runs, 2026-07-18):
+
+| Input | Result under single-title contract |
+|---|---|
+| "5 mind-bending movies: Inception, Shutter Island, Memento, Donnie Darko, Primer" | `title: null, confidence: low` → gives up entirely |
+| "This scene from Heat is unmatched" + comments naming Sicario, The Town | correctly picked **Heat**, ignored the distractors ✅ |
+| "Blade Runner vs Blade Runner 2049 — which ending hits harder?" | `title: null, confidence: low` → gives up |
+
+The distractor case is handled well and must not regress. The failure mode is
+*safe* (never a wrong add) but unhelpful: the JSON contract has exactly one
+`title` slot, so a listicle has no way to express itself.
+
+**Contract change**: identification returns a *list* of candidate
+identifications rather than a single one. Outcomes become:
+
+- **1 title, high confidence** → auto-add (today's behavior, unchanged)
+- **N titles** → multi-select confirmation on the originating channel (below)
+- **0 titles** → today's "couldn't identify — reply with the title" path
+
+**Use the caption's own stated count as a prior.** If the title/caption says
+"top 10" / "5 movies" / "part 3 of ranking every…", that's a strong signal for
+how many identifications to expect, and a way to tell the user "the post claims
+10, I could only identify 7" — far more useful than silently returning 7. Feed
+the stated count into the prompt and surface any shortfall in the reply.
+
+**Cap** the number of titles offered (default ~10) so a "top 50" post can't dump
+50 adds into Radarr; state plainly when results were truncated rather than
+silently dropping them (per §1's "no silent caps" principle).
+
+**Multi-select UX differs by platform** — the `IntakeChannel` abstraction (§4)
+grows a `send_multi_select()` alongside `send_confirmation()`:
+
+- **Discord**: native support — a string select menu (`min_values`/`max_values`,
+  max 25 options) gives real checkbox semantics in a single interaction, plus a
+  confirm button.
+- **Telegram**: no native multi-select. Simulate with toggle buttons that edit
+  the message in place (`☐ Inception` → tap → `☑ Inception`) and an
+  "➕ Add selected (N)" button. Requires holding per-request selection state
+  between callbacks — persist it on the request row, not in memory, so it
+  survives a restart.
+- Both get **Add all** and **None of these**. "Add all" writes several items at
+  once, so it re-prompts for confirmation before firing.
+- **WhatsApp** (when enabled): falls back to numbered replies ("Reply 1,3,5"),
+  consistent with §4's note that native buttons are unreliable there.
 
 ### 5.5 Fulfillment target — Radarr/Sonarr direct, or via Overseerr/Jellyseerr
 
