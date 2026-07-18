@@ -163,7 +163,18 @@ def create_app() -> FastAPI:
 
     dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
     if dist.is_dir():
-        app.mount("/", StaticFiles(directory=dist, html=True), name="frontend")
+        app.mount("/assets", StaticFiles(directory=dist / "assets"), name="assets")
+
+        # SPA fallback: any non-API, non-asset path serves index.html so
+        # client-side routes (/library, /settings/...) survive a hard refresh.
+        from fastapi.responses import FileResponse
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        async def spa_fallback(full_path: str):
+            candidate = dist / full_path
+            if full_path and candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(dist / "index.html")
 
     return app
 
