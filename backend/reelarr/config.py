@@ -11,6 +11,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,6 +41,22 @@ class AppConfig(BaseSettings):
     stt_api_key: str = ""
     enable_vision: bool = False
     ollama_url: str = "http://ollama-nvidia:11434"  # used only for "is the model pulled" checks
+
+    @field_validator(
+        "radarr_quality_profile_id", "sonarr_quality_profile_id", mode="before"
+    )
+    @classmethod
+    def _blank_int_to_none(cls, v: object) -> object:
+        """Treat an empty/whitespace env var as unset rather than a parse error.
+
+        These are normally set from the UI after a Test call populates the
+        dropdown, so `RADARR_QUALITY_PROFILE_ID=` (declared but blank) is a
+        completely ordinary state — it must not crash-loop the whole app at
+        startup, which is what pydantic's default int parsing would do.
+        """
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
     # --- Metadata ---
     tmdb_api_key: str = ""
