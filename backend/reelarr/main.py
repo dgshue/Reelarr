@@ -187,8 +187,26 @@ def create_app() -> FastAPI:
 
     from fastapi.staticfiles import StaticFiles
 
-    dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
-    if dist.is_dir():
+    # Resolve the built UI across both layouts: a source checkout (where the
+    # package sits at <repo>/backend/reelarr) and the Docker image (where the
+    # package is pip-installed into site-packages, far from /app/frontend/dist).
+    # The old repo-relative-only lookup silently found nothing in the image and
+    # served 404s for the entire UI.
+    candidates = []
+    if cfg.frontend_dist:
+        candidates.append(Path(cfg.frontend_dist))
+    candidates += [
+        Path(__file__).resolve().parent.parent.parent / "frontend" / "dist",  # source checkout
+        Path("/app/frontend/dist"),                                          # docker image
+    ]
+    dist = next((p for p in candidates if p.is_dir()), None)
+    if dist is None:
+        logger.warning(
+            "frontend build not found (looked in: %s) — API works but the web UI "
+            "will 404; set FRONTEND_DIST to override",
+            ", ".join(str(p) for p in candidates),
+        )
+    if dist is not None:
         app.mount("/assets", StaticFiles(directory=dist / "assets"), name="assets")
 
         # SPA fallback: any non-API, non-asset path serves index.html so

@@ -23,6 +23,9 @@ class AppConfig(BaseSettings):
     port: int = 7979  # Reelarr's claimed port, in the *arr 4-digit tradition
     url_base: str = ""  # reverse-proxy subpath, e.g. "/reelarr"
     log_level: str = "info"
+    # Override where the built web UI lives. Normally auto-detected (source
+    # checkout vs. Docker image); set only for non-standard layouts.
+    frontend_dist: str = ""
 
     # --- Storage ---
     database_url: str = "sqlite:///./data/reelarr.db"
