@@ -1,0 +1,116 @@
+# Reelarr — docker-stacks style stack file (copy into F:\GitHub\docker-stacks
+# once the scaffold is approved; Portainer GitOps polls every 5 minutes).
+#
+# Conventions match media-stack.yaml / ai-services.yaml:
+#   - external traefik_default network, container-name DNS
+#   - PUID=0 / PGID=143 / TZ=America/New_York
+#   - /nvme0/appdata/<app> bind mounts for config
+#   - dgshue/<image>:latest + pull_policy: always (Watchtower auto-updates)
+#
+# Secrets policy: all sensitive values come from ${VAR} substitution against
+# the stack's environment (Portainer stack env vars / .env) — never inline.
+#
+# Prereq on the host: /nvme0/appdata/reelarr/litellm-config.yaml
+# (copy from this repo's deploy/litellm-config.yaml).
+
+version: "3.8"
+
+networks:
+  traefik_default:
+    external: true
+
+services:
+  reelarr:
+    image: dgshue/reelarr:latest
+    pull_policy: always
+    container_name: reelarr
+    restart: unless-stopped
+    networks:
+      - traefik_default
+    ports:
+      - "7979:7979"
+    environment:
+      - PUID=0
+      - PGID=143
+      - TZ=America/New_York
+      # --- AI ---
+      - LITELLM_BASE_URL=http://reelarr-litellm:4000
+      - LITELLM_API_KEY=${LITELLM_MASTER_KEY}
+      - TEXT_MODEL=reelarr-text
+      - VISION_MODEL=reelarr-vision
+      - STT_MODEL=reelarr-stt
+      - ENABLE_VISION=false
+      - OLLAMA_URL=http://ollama-nvidia:11434
+      # --- Metadata ---
+      - TMDB_API_KEY=${TMDB_API_KEY}
+      # --- Fulfillment ---
+      - FULFILLMENT_TARGET=direct
+      - RADARR_URL=http://radarr:7878
+      - RADARR_API_KEY=${RADARR_API_KEY}
+      - RADARR_ROOT_FOLDER=${RADARR_ROOT_FOLDER}
+      - RADARR_QUALITY_PROFILE_ID=${RADARR_QUALITY_PROFILE_ID}
+      - SONARR_URL=http://sonarr:8989
+      - SONARR_API_KEY=${SONARR_API_KEY}
+      - SONARR_ROOT_FOLDER=${SONARR_ROOT_FOLDER}
+      - SONARR_QUALITY_PROFILE_ID=${SONARR_QUALITY_PROFILE_ID}
+      - SEERR_URL=http://overseerr:5055
+      - SEERR_API_KEY=${SEERR_API_KEY}
+      # --- Sources ---
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ALLOWED_CHAT_IDS=${TELEGRAM_ALLOWED_CHAT_IDS}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+      - EVOLUTION_API_URL=${EVOLUTION_API_URL}
+      - EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
+      - WHATSAPP_ALLOWED_NUMBERS=${WHATSAPP_ALLOWED_NUMBERS}
+    volumes:
+      - /nvme0/appdata/reelarr:/config
+      - /nvme0/appdata/reelarr/cookies:/config/cookies
+      - /nvme0/transcode/reelarr-tmp:/tmp/reelarr
+    # Reelarr has its own Forms-login auth; public exposure via Traefik is
+    # optional — uncomment to publish (consider keeping forwardauth).
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.http.routers.reelarr.rule=Host(`reelarr.shuehome.net`)"
+    #   - "traefik.http.routers.reelarr.entrypoints=websecure"
+    #   - "traefik.http.routers.reelarr.tls.certresolver=cloudflare"
+    #   - "traefik.http.services.reelarr.loadbalancer.server.port=7979"
+    #   - "traefik.docker.network=traefik_default"
+    #   - "traefik.http.routers.reelarr.middlewares=forwardauth@docker"
+    depends_on:
+      - reelarr-litellm
+
+  reelarr-litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    pull_policy: always
+    container_name: reelarr-litellm
+    restart: unless-stopped
+    networks:
+      - traefik_default
+    ports:
+      - "4000:4000"
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - /nvme0/appdata/reelarr/litellm-config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+
+  # --- Optional: WhatsApp intake (opt-in, unofficial engine — ban risk).
+  # Uncomment only after reading the README's WhatsApp section.
+  # Evolution API v2 also expects Postgres + Redis for production use.
+  # evolution-api:
+  #   image: evoapicloud/evolution-api:latest
+  #   pull_policy: always
+  #   container_name: evolution-api
+  #   restart: unless-stopped
+  #   networks:
+  #     - traefik_default
+  #   ports:
+  #     - "8085:8080"
+  #   environment:
+  #     - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
+  #   volumes:
+  #     - /nvme0/appdata/evolution-api:/evolution/instances

@@ -1,0 +1,108 @@
+# Local dev / testing compose: `docker compose up --build`
+# Secrets come from .env (gitignored) — never hardcode them here.
+# For the docker-stacks (Portainer/GitOps) deployment, see deploy/reelarr.yaml.
+
+networks:
+  traefik_default:
+    external: true
+
+services:
+  reelarr:
+    # Builds locally today; once dgshue/reelarr:latest is published, plain
+    # `docker compose up` pulls it instead (Watchtower-compatible).
+    image: ${REELARR_IMAGE:-dgshue/reelarr:latest}
+    build: .
+    container_name: reelarr
+    restart: unless-stopped
+    networks:
+      - traefik_default
+    ports:
+      - "7979:7979"
+    environment:
+      - PUID=0
+      - PGID=143
+      - TZ=America/New_York
+      # --- AI ---
+      - LITELLM_BASE_URL=http://reelarr-litellm:4000
+      - LITELLM_API_KEY=${LITELLM_MASTER_KEY:-}
+      - TEXT_MODEL=${TEXT_MODEL:-reelarr-text}
+      - VISION_MODEL=${VISION_MODEL:-reelarr-vision}
+      - STT_MODEL=${STT_MODEL:-reelarr-stt}
+      - STT_BASE_URL=${STT_BASE_URL:-}
+      - ENABLE_VISION=${ENABLE_VISION:-false}
+      - OLLAMA_URL=${OLLAMA_URL:-http://ollama-nvidia:11434}
+      # --- Metadata ---
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+      # --- Fulfillment ---
+      - FULFILLMENT_TARGET=${FULFILLMENT_TARGET:-direct}
+      - RADARR_URL=${RADARR_URL:-http://radarr:7878}
+      - RADARR_API_KEY=${RADARR_API_KEY:-}
+      - RADARR_ROOT_FOLDER=${RADARR_ROOT_FOLDER:-}
+      - RADARR_QUALITY_PROFILE_ID=${RADARR_QUALITY_PROFILE_ID:-}
+      - SONARR_URL=${SONARR_URL:-http://sonarr:8989}
+      - SONARR_API_KEY=${SONARR_API_KEY:-}
+      - SONARR_ROOT_FOLDER=${SONARR_ROOT_FOLDER:-}
+      - SONARR_QUALITY_PROFILE_ID=${SONARR_QUALITY_PROFILE_ID:-}
+      - SEERR_URL=${SEERR_URL:-http://overseerr:5055}
+      - SEERR_API_KEY=${SEERR_API_KEY:-}
+      # --- Sources ---
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_ALLOWED_CHAT_IDS=${TELEGRAM_ALLOWED_CHAT_IDS:-}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - DISCORD_ALLOWED_CHANNEL_IDS=${DISCORD_ALLOWED_CHANNEL_IDS:-}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN:-}
+      - SLACK_ALLOWED_CHANNEL_IDS=${SLACK_ALLOWED_CHANNEL_IDS:-}
+      - EVOLUTION_API_URL=${EVOLUTION_API_URL:-}
+      - EVOLUTION_API_KEY=${EVOLUTION_API_KEY:-}
+      - EVOLUTION_INSTANCE=${EVOLUTION_INSTANCE:-reelarr}
+      - WHATSAPP_ALLOWED_NUMBERS=${WHATSAPP_ALLOWED_NUMBERS:-}
+    volumes:
+      - reelarr-config:/config          # SQLite db + cookies
+      - reelarr-tmp:/tmp/reelarr        # temp downloads (cleaned per request)
+      - reelarr-cookies:/config/cookies # Instagram cookie files
+    depends_on:
+      - litellm
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: reelarr-litellm
+    restart: unless-stopped
+    networks:
+      - traefik_default
+    ports:
+      - "4000:4000"
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-}
+      # Optional commercial keys referenced from litellm-config.yaml:
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    volumes:
+      - ./deploy/litellm-config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+
+  # WhatsApp is opt-in (`docker compose --profile whatsapp up`) — unofficial
+  # engine, real ban risk; see README before enabling.
+  # NOTE: Evolution API v2 also expects Postgres + Redis for persistence —
+  # this minimal entry is enough to pair and test, but consult Evolution's
+  # docs for a production setup before relying on it.
+  evolution-api:
+    image: evoapicloud/evolution-api:latest
+    container_name: evolution-api
+    restart: unless-stopped
+    profiles:
+      - whatsapp
+    networks:
+      - traefik_default
+    ports:
+      - "8085:8080"
+    environment:
+      - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY:-}
+    volumes:
+      - evolution-instances:/evolution/instances
+
+volumes:
+  reelarr-config: {}
+  reelarr-tmp: {}
+  reelarr-cookies: {}
+  evolution-instances: {}

@@ -1,0 +1,36 @@
+[project]
+name = "reelarr"
+version = "0.1.0"
+description = "Share a social video link, AI identifies the movie/show, adds it to Radarr/Sonarr (or routes through Overseerr/Jellyseerr)."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "httpx>=0.27",
+    "python-telegram-bot>=21.0",
+    "yt-dlp>=2025.1.1",
+]
+
+[project.optional-dependencies]
+# Structural stub channels — only needed if you enable that Source.
+discord = ["discord.py>=2.4"]
+slack = ["slack-bolt>=1.20"]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["reelarr*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

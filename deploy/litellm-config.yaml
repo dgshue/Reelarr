@@ -1,0 +1,46 @@
+# LiteLLM proxy config (spec §5) — Reelarr speaks one OpenAI-compatible
+# dialect against this proxy; the proxy fans out to Ollama, Speaches, and any
+# optional commercial providers.
+#
+# Model aliases below are what Reelarr's TEXT_MODEL / VISION_MODEL / STT_MODEL
+# env vars reference by default.
+
+model_list:
+  # --- Local text reasoning (Ollama, already running as ollama-nvidia) ---
+  - model_name: reelarr-text
+    litellm_params:
+      model: ollama/qwen3:8b
+      api_base: http://ollama-nvidia:11434
+
+  # --- Local vision, Tier 3 fallback (feature-flagged via ENABLE_VISION) ---
+  - model_name: reelarr-vision
+    litellm_params:
+      model: ollama/qwen2.5vl:7b
+      api_base: http://ollama-nvidia:11434
+
+  # --- Local STT (Speaches — already deployed, OpenAI-compatible) ---
+  # Model name must match a model pulled on the Speaches instance.
+  - model_name: reelarr-stt
+    litellm_params:
+      model: openai/Systran/faster-distil-whisper-small.en
+      api_base: http://ollama-speaches:8000/v1
+      api_key: "not-needed"
+
+  # --- Optional commercial add-ons (uncomment + set env keys to enable) ---
+  # - model_name: reelarr-text-groq
+  #   litellm_params:
+  #     model: groq/llama-3.3-70b-versatile
+  #     api_key: os.environ/GROQ_API_KEY
+  # - model_name: reelarr-vision-gemini
+  #   litellm_params:
+  #     model: gemini/gemini-2.0-flash
+  #     api_key: os.environ/GEMINI_API_KEY
+  # - model_name: reelarr-stt-groq
+  #   litellm_params:
+  #     model: groq/whisper-large-v3-turbo
+  #     api_key: os.environ/GROQ_API_KEY
+
+litellm_settings:
+  drop_params: true
+
+general_settings: {}
