@@ -19,12 +19,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 # --- Frame extraction tuning (Tier 3) ----------------------------------------
 SCENE_THRESHOLD = 0.3   # ffmpeg select=gt(scene,X) — fraction of pixels changed
@@ -178,6 +181,16 @@ class YtDlpResolver:
         comments = sorted(comments, key=lambda c: c.get("like_count") or 0, reverse=True)
         top_comments = [c.get("text", "") for c in comments[:25] if c.get("text")]
 
+        # yt-dlp has no TikTok comment extractor — it reports `comment_count` in
+        # the thousands but returns none, so the single strongest signal for
+        # hashtag-spam captions ("#movie #fyp") was being thrown away. Fall back
+        # to TikTok's own web comment API, which needs no auth. Best-effort: a
+        # failure here must never fail the whole request.
+        if not top_comments and (detect_platform(url) == "tiktok"):
+            aweme_id = info.get("id")
+            if aweme_id:
+                top_comments = await self._fetch_tiktok_comments(str(aweme_id))
+
         description = info.get("description") or ""
         hashtags = [w for w in description.split() if w.startswith("#")]
 
@@ -190,6 +203,43 @@ class YtDlpResolver:
             top_comments=top_comments,
             duration=info.get("duration"),
         )
+
+    async def _fetch_tiktok_comments(self, aweme_id: str, limit: int = 25) -> list[str]:
+        """Top comments via TikTok's web comment API (no auth required).
+
+        `aid=1988` is TikTok's web app id — without it the endpoint returns
+        `status_code: 5` and an empty body, which is why naive scrapers see
+        nothing. Returns [] on any failure; comments are an optional signal.
+        """
+        import httpx
+
+        params = {"aweme_id": aweme_id, "count": 50, "cursor": 0, "aid": 1988}
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            ),
+            "Referer": "https://www.tiktok.com/",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.get(
+                    "https://www.tiktok.com/api/comment/list/",
+                    params=params,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:  # network, JSON, HTTP — all non-fatal
+            logger.warning("tiktok comment fetch failed for %s: %s", aweme_id, exc)
+            return []
+
+        raw = data.get("comments") or []
+        raw.sort(key=lambda c: c.get("digg_count") or 0, reverse=True)
+        texts = [c.get("text", "").strip() for c in raw[:limit]]
+        texts = [t for t in texts if t]
+        logger.info("tiktok comment fallback: %d comments for %s", len(texts), aweme_id)
+        return texts
 
     async def extract_audio(self, url: str) -> Path:
         workdir = await self._ensure_download(url)
