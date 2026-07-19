@@ -293,6 +293,96 @@ async def test_high_confidence_multiple_exact_matches_needs_confirmation():
     assert len(result.candidates) == 2
 
 
+# --- Year-drift gate (_unambiguous_top): the LLM's year is soft evidence ------
+
+GORGE_2025 = TmdbMatch(tmdb_id=950396, title="The Gorge", year=2025, media_type="movie",
+                       popularity=22.99, vote_count=3932)
+GORGE_1968 = TmdbMatch(tmdb_id=964734, title="The Gorge", year=1968, media_type="movie",
+                       popularity=0.24, vote_count=1)
+
+
+def make_gorge_pipeline(year, matches):
+    return make_pipeline(
+        text_llm=FakeTextLLM(
+            {"title": "The Gorge", "year": year, "type": "movie", "confidence": "high"}
+        ),
+        tmdb=FakeTmdb(matches),
+    )
+
+
+async def test_year_drift_within_tolerance_still_auto_adds():
+    """The measured 'The Gorge' bug: title right, year hallucinated as 2023
+    for the 2025 film. A ±2 drift must not block the auto-add when the only
+    same-title rival is both far in year and far in popularity."""
+    pipeline = make_gorge_pipeline(2023, [GORGE_2025, GORGE_1968])
+    result = await pipeline.run(URL)
+    assert result.outcome == PipelineOutcome.AUTO_ADD
+    assert result.match is GORGE_2025
+
+
+async def test_year_gap_beyond_tolerance_needs_confirmation():
+    """A unique exact-title match with a wildly wrong year still ranks first,
+    but goes to confirmation rather than silently overriding the LLM's claim."""
+    pipeline = make_gorge_pipeline(1990, [GORGE_2025])
+    result = await pipeline.run(URL)
+    assert result.outcome == PipelineOutcome.NEEDS_CONFIRMATION
+    assert result.candidates[0] is GORGE_2025
+
+
+async def test_drifted_year_cannot_pick_between_same_title_rivals():
+    """The measured 'Digger' rerun that returned year=2023: Digger (2021) is
+    nearer the claimed year but Digger (2026) is ~30x more popular — the two
+    axes disagree, so a hallucinated year must not silently pick the 2021
+    film. This is the case the old exact-year gate got wrong."""
+    digger_2021 = TmdbMatch(tmdb_id=656272, title="Digger", year=2021,
+                            media_type="movie", popularity=0.69, vote_count=28)
+    digger_2026 = TmdbMatch(tmdb_id=1248832, title="Digger", year=2026,
+                            media_type="movie", popularity=20.76, vote_count=0)
+    pipeline = make_pipeline(
+        text_llm=FakeTextLLM(
+            {"title": "Digger", "year": 2023, "type": "movie", "confidence": "high"}
+        ),
+        # Ranked order (year proximity puts 2021 first) — the gate must still balk.
+        tmdb=FakeTmdb([digger_2021, digger_2026]),
+    )
+    result = await pipeline.run(URL)
+    assert result.outcome == PipelineOutcome.NEEDS_CONFIRMATION
+
+
+async def test_null_year_with_same_title_rivals_needs_confirmation():
+    """'Digger' with year=None: three real films named Digger and no year
+    evidence — popularity alone must never auto-add (votes=0 on the top film;
+    it is popular because it is new, not because it is confirmed right)."""
+    diggers = [
+        TmdbMatch(tmdb_id=1248832, title="Digger", year=2026, media_type="movie",
+                  popularity=20.76),
+        TmdbMatch(tmdb_id=656272, title="Digger", year=2021, media_type="movie",
+                  popularity=0.69),
+        TmdbMatch(tmdb_id=290686, title="Digger", year=1993, media_type="movie",
+                  popularity=0.59),
+    ]
+    pipeline = make_pipeline(
+        text_llm=FakeTextLLM(
+            {"title": "Digger", "year": None, "type": "movie", "confidence": "high"}
+        ),
+        tmdb=FakeTmdb(diggers),
+    )
+    result = await pipeline.run(URL)
+    assert result.outcome == PipelineOutcome.NEEDS_CONFIRMATION
+    assert result.candidates[0].tmdb_id == 1248832  # best guess still offered first
+
+
+async def test_exact_year_hit_still_rules_out_same_title_rivals():
+    """Unchanged from the original gate: a gap-0 year hit disambiguates
+    same-title films at other years (Heat 1995 vs the 2013 remake)."""
+    heat_2013 = TmdbMatch(tmdb_id=2, title="Heat", year=2013, media_type="movie",
+                          popularity=50.0)  # more popular must NOT matter at gap 0
+    pipeline = make_pipeline(tmdb=FakeTmdb([HEAT, heat_2013]))
+    result = await pipeline.run(URL)
+    assert result.outcome == PipelineOutcome.AUTO_ADD
+    assert result.match is HEAT
+
+
 async def test_tv_candidates_get_tvdb_ids_resolved():
     tmdb = FakeTmdb([SEVERANCE], tvdb_ids={95396: 371980})
     pipeline = make_pipeline(

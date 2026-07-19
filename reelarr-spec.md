@@ -233,13 +233,30 @@ could bypass LiteLLM later if ever needed, without a rewrite.
    local vision models OCR subtitles near-perfectly and recognize actors in close-ups, but
    hallucinate when asked to name the title directly — hence evidence + verification, not "what
    movie is this?")
-4. TMDB `/search/multi` lookup (+ TVDB external-ID resolution for TV, since Sonarr needs `tvdbId`)
-5. **Identification-confidence gate**: high + single exact match → proceed straight to fulfillment; otherwise → confirmation prompt (inline buttons or numbered reply, per §4) on the originating channel with the top 3 matches + "None of these" — this gate answers "is this the right title," independent of §5.5's fulfillment gate
+4. TMDB `/search/multi` lookup (+ TVDB external-ID resolution for TV, since Sonarr needs `tvdbId`).
+   The identified **year is a soft ranking signal, never a filter** — measured live (2026-07-18),
+   the LLM's title is reliable but its year is frequently hallucinated ("The Gorge (2025)"
+   identified as 2023 with high confidence, and the old exact-year sort then ranked "The Corpse in
+   the Gorge (2023)" above the actual film). Candidates are ranked by exact title match first, then
+   year proximity (±1–2 is near-free drift; a large gap demotes but never disqualifies), then
+   popularity/vote count as a tiebreak.
+5. **Identification-confidence gate**: high + unambiguous top match → proceed straight to
+   fulfillment; otherwise → confirmation prompt (inline buttons or numbered reply, per §4) on the
+   originating channel with the top 3 matches + "None of these" — this gate answers "is this the
+   right title," independent of §5.5's fulfillment gate. "Unambiguous" means the top match has the
+   exact identified title and, when other films share that exact title, the year evidence genuinely
+   separates them: an exact year hit rules rivals out, a ±1–2 drifted year only counts when
+   popularity agrees, and a missing year with same-title rivals always asks — a hallucinated year
+   must never single-handedly pick between films that share a title.
 6. **Fulfillment** — see §5.5, routes to either Radarr/Sonarr directly or Overseerr/Jellyseerr for approval
 
-System prompt, JSON contract, and defensive parsing carry forward unchanged from
+System prompt, JSON contract, and defensive parsing carry forward from
 `media-share-pipeline-spec.md` §"LLM identification prompt", except for the
-multi-title extension in §5.4.
+multi-title extension in §5.4 and one addition (re-tested against qwen3:8b,
+2026-07-18): the prompt now instructs the model to prefer a year stated in the
+caption/comments/transcript over its own recall, and to return `null` when no
+year is stated and it isn't certain — a confidently wrong year was the measured
+failure mode, and `null` is handled fine by the soft ranking above.
 
 ### 5.4 Multi-title clips (listicles / "top 10" posts)
 

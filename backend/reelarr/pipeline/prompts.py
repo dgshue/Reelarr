@@ -1,7 +1,12 @@
 """LLM identification prompt + JSON contract.
 
-Carried forward verbatim from media-share-pipeline-spec.md §"LLM identification
-prompt (Tier 1/2)" — do not tweak wording without re-testing local models.
+Carried forward from media-share-pipeline-spec.md §"LLM identification prompt
+(Tier 1/2)" — do not tweak wording without re-testing local models. One
+addition since (re-tested live against qwen3:8b, 2026-07-18): explicit year
+guidance, because the model returned confident wrong years ('The Gorge (2025)'
+as 2023 despite comments saying 2025) and unstable years across reruns. A null
+year is handled fine downstream (year is a soft ranking signal); a wrong year
+is actively harmful.
 """
 
 from __future__ import annotations
@@ -16,7 +21,10 @@ IDENTIFICATION_SYSTEM_PROMPT = (
     '"type": "movie"|"tv"|null, "confidence": "high"|"medium"|"low" }. '
     "Use null title if you cannot identify it. Captions and comments frequently "
     "name the title directly — weight explicit mentions heavily. Ignore hashtag "
-    "spam like #fyp #movie #film unless a specific title is named."
+    "spam like #fyp #movie #film unless a specific title is named. "
+    "For year: prefer a year stated in the caption, comments, or transcript "
+    "over your own memory of the release date. If no year is stated and you "
+    "are not certain, use null — a guessed year is worse than no year."
 )
 
 # --- Tier 3 (vision) prompts --------------------------------------------------

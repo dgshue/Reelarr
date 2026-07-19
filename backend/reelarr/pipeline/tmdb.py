@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import httpx
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 POSTER_BASE = "https://image.tmdb.org/t/p/w342"
+
+# The LLM's year is frequently off by a year or two even when the title is
+# right (streaming vs theatrical dates, plain hallucination). Within this
+# window a mismatch is treated as drift, not as evidence of a different film.
+YEAR_DRIFT_TOLERANCE = 2
 
 
 @dataclass
@@ -19,6 +25,65 @@ class TmdbMatch:
     tvdb_id: int | None = None  # resolved lazily for TV (Sonarr needs it)
     poster_url: str | None = None
     overview: str | None = None
+    popularity: float = 0.0   # TMDB popularity — ranking tiebreak only
+    vote_count: int = 0
+
+
+def normalize_title(title: str) -> str:
+    """Casefold + collapse whitespace — the single definition of 'same title'."""
+    return re.sub(r"\s+", " ", title.strip().casefold())
+
+
+def _title_similarity(query: str, title: str) -> float:
+    """Token overlap in [0, 1]; 1.0 iff the normalized titles are identical.
+
+    Deliberately crude — it only has to keep near-titles ("The Gorge 2")
+    ahead of loose matches ("Enormous: The Gorge Story") among NON-exact
+    candidates. Exact matches are ranked by the boolean above it.
+    """
+    q = set(re.split(r"[^\w]+", normalize_title(query))) - {""}
+    t = set(re.split(r"[^\w]+", normalize_title(title))) - {""}
+    if not q or not t:
+        return 0.0
+    return len(q & t) / max(len(q), len(t))
+
+
+def _year_bucket(ident_year: int | None, match_year: int | None) -> int:
+    """Year proximity as a coarse bucket, NOT a filter (the identified year is
+    frequently hallucinated — measured live: 'The Gorge (2025)' identified as
+    2023). Exact is best, ±1-2 is near-free (release-date vs streaming-date
+    drift), unknown beats a distant year, a large gap is a strong demotion but
+    never disqualifying."""
+    if ident_year is None or match_year is None:
+        return 2
+    gap = abs(ident_year - match_year)
+    if gap == 0:
+        return 4
+    if gap <= YEAR_DRIFT_TOLERANCE:
+        return 3
+    if gap <= 5:
+        return 1
+    return 0
+
+
+def rank_matches(query: str, year: int | None, matches: list[TmdbMatch]) -> list[TmdbMatch]:
+    """Order candidates by evidence quality: exact title match dominates
+    everything, then title similarity, then year proximity, then popularity/
+    vote count. Replaces the old exact-year float, which let junk like
+    'The Corpse in the Gorge (2023)' outrank 'The Gorge (2025)' whenever the
+    LLM hallucinated the year."""
+    wanted = normalize_title(query)
+
+    def key(m: TmdbMatch) -> tuple:
+        return (
+            normalize_title(m.title) == wanted,
+            round(_title_similarity(query, m.title), 3),
+            _year_bucket(year, m.year),
+            m.popularity,
+            m.vote_count,
+        )
+
+    return sorted(matches, key=key, reverse=True)  # stable: TMDB order breaks ties
 
 
 @dataclass
@@ -72,12 +137,12 @@ class TmdbClient:
                     media_type=media_type,
                     poster_url=f"{POSTER_BASE}{item['poster_path']}" if item.get("poster_path") else None,
                     overview=item.get("overview"),
+                    popularity=item.get("popularity") or 0.0,
+                    vote_count=item.get("vote_count") or 0,
                 )
             )
-        if year is not None:
-            # Stable sort: matches for the identified year float to the top.
-            matches.sort(key=lambda m: 0 if m.year == year else 1)
-        return matches
+        # Year is a soft ranking signal only — never a filter (see rank_matches).
+        return rank_matches(query, year, matches)
 
     async def search_person(self, name: str) -> int | None:
         """Best-match person id for an actor name, or None."""

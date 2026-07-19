@@ -4,8 +4,12 @@
 2. Tier 2 (transcript): if UNKNOWN or confidence < high -> audio -> STT -> re-prompt
 3. Tier 3 (frames, feature-flagged): if still unresolved and enable_vision ->
    evidence accumulation + TMDB verification (see _tier3_vision below)
-4. TMDB /search/multi lookup (+ TVDB external-ID resolution for TV)
-5. Confidence gate: high + single exact match -> AUTO_ADD; otherwise -> CONFIRM
+4. TMDB /search/multi lookup (+ TVDB external-ID resolution for TV). The
+   identified year is a SOFT ranking signal, never a filter — the LLM's title
+   is reliable but its year is frequently hallucinated (see rank_matches).
+5. Confidence gate: high + unambiguous top match -> AUTO_ADD; otherwise ->
+   CONFIRM (see _unambiguous_top for how same-title rivals and year drift
+   are weighed)
 6. Fulfillment — performed by the caller (see reelarr.services.processor), routed
    per Settings -> Fulfillment (spec §5.5)
 
@@ -54,7 +58,13 @@ from reelarr.pipeline.prompts import (
     parse_identification,
     parse_multi_title_extraction,
 )
-from reelarr.pipeline.tmdb import PersonCredit, TmdbClient, TmdbMatch
+from reelarr.pipeline.tmdb import (
+    YEAR_DRIFT_TOLERANCE,
+    PersonCredit,
+    TmdbClient,
+    TmdbMatch,
+    normalize_title,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -258,10 +268,7 @@ class IdentificationPipeline:
 
         # --- Step 5: identification-confidence gate ------------------------
         top = matches[0]
-        exact_single = self._is_exact_match(ident, top) and (
-            len(matches) == 1 or not self._is_exact_match(ident, matches[1])
-        )
-        if ident.confidence == "high" and exact_single:
+        if ident.confidence == "high" and self._unambiguous_top(ident, matches):
             return PipelineResult(
                 outcome=PipelineOutcome.AUTO_ADD,
                 identification=ident,
@@ -629,8 +636,64 @@ class IdentificationPipeline:
 
     @staticmethod
     def _is_exact_match(ident: Identification, match: TmdbMatch) -> bool:
+        """Exact title, and the year (when both known) within ±2 — the LLM's
+        year drifts by a year or two even when the title is right (release
+        date vs streaming date, or plain hallucination; measured live on
+        'The Gorge (2025)' identified as 2023)."""
         if not ident.title:
             return False
-        title_eq = ident.title.strip().lower() == match.title.strip().lower()
-        year_ok = ident.year is None or match.year is None or ident.year == match.year
+        title_eq = normalize_title(ident.title) == normalize_title(match.title)
+        year_ok = (
+            ident.year is None or match.year is None
+            or abs(ident.year - match.year) <= YEAR_DRIFT_TOLERANCE
+        )
         return title_eq and year_ok
+
+    @staticmethod
+    def _unambiguous_top(ident: Identification, matches: list[TmdbMatch]) -> bool:
+        """AUTO_ADD half of the step-5 gate: is the top-ranked match the one
+        title the identification can only mean?
+
+        The LLM's title is reliable; its year is not (spec §5 step 5 measured
+        failures: 'The Gorge (2025)' as 2023 high-confidence, 'Digger' with an
+        unstable None/2023 year). So the year contributes evidence but a
+        hallucinated year must never single-handedly pick between same-title
+        rivals:
+
+        - unique exact-title match  -> add when the year agrees within ±2 (or
+          either side has no year). A larger gap still ranks the film first
+          but goes to confirmation.
+        - same-title rivals + exact year hit (gap 0) -> rivals at other years
+          are ruled out (unchanged from the original gate).
+        - same-title rivals + year drift (gap 1-2)  -> the top must beat every
+          rival on BOTH axes: strictly closer year AND >= popularity. A rival
+          that is closer in neither but far more popular means the year is
+          probably wrong evidence — ask instead ('Digger' 2023: Digger (2021)
+          is nearer the claimed year, Digger (2026) is 30x more popular).
+        - same-title rivals + no year -> nothing disambiguates them: ask.
+        """
+        if not ident.title or not matches:
+            return False
+        wanted = normalize_title(ident.title)
+        top = matches[0]
+        if normalize_title(top.title) != wanted:
+            return False
+        rivals = [m for m in matches[1:] if normalize_title(m.title) == wanted]
+        if not rivals:
+            return (
+                ident.year is None or top.year is None
+                or abs(ident.year - top.year) <= YEAR_DRIFT_TOLERANCE
+            )
+        if ident.year is None or top.year is None:
+            return False
+        gap = abs(ident.year - top.year)
+        if gap == 0:
+            return all(r.year is not None and r.year != ident.year for r in rivals)
+        if gap <= YEAR_DRIFT_TOLERANCE:
+            return all(
+                r.year is not None
+                and abs(ident.year - r.year) > gap
+                and top.popularity >= r.popularity
+                for r in rivals
+            )
+        return False
