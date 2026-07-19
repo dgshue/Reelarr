@@ -72,3 +72,11 @@ class DiscordChannel(IntakeChannel):
         self, chat_ref: str, prompt: str, candidates: list[ConfirmationCandidate]
     ) -> None:
         raise NotImplementedError("Discord channel not wired yet")
+
+    # send_multi_select (spec §5.4): when this adapter is wired, use a native
+    # string select menu — discord.ui.Select(min_values=0,
+    # max_values=len(options), options<=25; Reelarr's cap of 10 is well under
+    # the platform limit) plus a confirm button. The menu interaction submits
+    # the whole selection at once: forward it via the handler's "replace"
+    # action, then "confirm" on the button — no per-toggle round-trips and no
+    # update_multi_select needed (the base no-arg contract already fits).

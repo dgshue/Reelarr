@@ -3,10 +3,13 @@
 from reelarr.pipeline.prompts import (
     IDENTIFICATION_SYSTEM_PROMPT,
     build_evidence_content,
+    build_multi_title_content,
     build_user_content,
+    detect_listicle_signal,
     parse_actor_guesses,
     parse_evidence_identification,
     parse_identification,
+    parse_multi_title_extraction,
 )
 
 
@@ -144,6 +147,90 @@ def test_parse_evidence_identification_caps_candidates_and_drops_unknown():
     )
     candidates, _ = parse_evidence_identification(raw)
     assert [c.title for c in candidates] == ["A", "B", "C"]
+
+
+# --- Multi-title (listicle) extraction, spec §5.4 -------------------------------
+
+
+def test_detect_listicle_signal_patterns():
+    # Numeric and word-number counts
+    assert detect_listicle_signal("top 10 horror films of the decade") == (True, 10)
+    assert detect_listicle_signal("5 mind-bending movies you need to watch") == (True, 5)
+    assert detect_listicle_signal("five underrated sci-fi films") == (True, 5)
+    assert detect_listicle_signal("my top5 comfort shows") == (True, 5)
+    # Keyword-only hints: no count prior
+    assert detect_listicle_signal("ranking every A24 horror movie") == (True, None)
+    assert detect_listicle_signal("Blade Runner vs Blade Runner 2049") == (True, None)
+    assert detect_listicle_signal("Alien versus Aliens, pick one") == (True, None)
+
+
+def test_detect_listicle_signal_no_false_positives():
+    # The proven single-subject cases must not trigger the multi path
+    assert detect_listicle_signal("This scene from Heat is unmatched") == (False, None)
+    assert detect_listicle_signal("best deniro scene #movie") == (False, None)
+    assert detect_listicle_signal(None) == (False, None)
+    assert detect_listicle_signal("") == (False, None)
+    # "2049" is a title year, not a count; "top tier" has no number
+    assert detect_listicle_signal("Blade Runner 2049 is a masterpiece") == (False, None)
+    assert detect_listicle_signal("top tier acting right here") == (False, None)
+
+
+def test_detect_listicle_signal_count_bounds():
+    # A count needs 2..100 to be a useful prior; the hint itself still fires
+    assert detect_listicle_signal("top 1 movie of all time") == (True, None)
+    assert detect_listicle_signal("top 999 movies") == (True, None)
+
+
+def test_parse_multi_title_extraction_full():
+    raw = (
+        '{"post_type": "listicle", "stated_count": 5, "titles": ['
+        '{"title": "Inception", "year": 2010, "type": "movie", "confidence": "high"},'
+        '{"title": "Memento", "year": "2000", "type": "movie", "confidence": "medium"}]}'
+    )
+    extraction = parse_multi_title_extraction(raw)
+    assert extraction.post_type == "listicle"
+    assert extraction.stated_count == 5
+    assert [t.title for t in extraction.titles] == ["Inception", "Memento"]
+    assert extraction.titles[1].year == 2000  # string year coerced
+    assert extraction.titles[1].confidence == "medium"
+
+
+def test_parse_multi_title_extraction_dedupes_and_drops_unknown():
+    raw = (
+        '{"post_type": "listicle", "stated_count": null, "titles": ['
+        '{"title": "Enemy", "year": 2013, "type": "movie", "confidence": "high"},'
+        '{"title": "enemy", "year": 2013, "type": "movie", "confidence": "low"},'
+        '{"title": null, "type": "movie", "confidence": "high"},'
+        '{"title": "  ", "type": "movie", "confidence": "high"}]}'
+    )
+    extraction = parse_multi_title_extraction(raw)
+    assert [t.title for t in extraction.titles] == ["Enemy"]
+
+
+def test_parse_multi_title_extraction_garbage_is_safe():
+    for raw in ("", "not json", '{"titles": "x"}', "null", '{"post_type": "rant"}'):
+        extraction = parse_multi_title_extraction(raw)
+        assert extraction.titles == []
+        assert extraction.post_type in ("unknown",)
+        assert extraction.stated_count is None
+
+
+def test_parse_multi_title_extraction_bogus_counts_discarded():
+    for count in (1, 0, -3, 999, "lots"):
+        raw = f'{{"post_type": "listicle", "stated_count": {count!r}, "titles": []}}'.replace("'", '"')
+        assert parse_multi_title_extraction(raw).stated_count is None
+
+
+def test_build_multi_title_content_includes_count_prior():
+    content = build_multi_title_content(
+        caption="top 10 horror films", transcript="Number ten, Hereditary.", stated_count=10
+    )
+    assert "CAPTION:" in content
+    assert "AUDIO TRANSCRIPT:" in content
+    assert "claims this post covers 10 titles" in content
+    assert "do not invent titles" in content
+    # No prior -> no NOTE section
+    assert "claims this post covers" not in build_multi_title_content(caption="x")
 
 
 def test_build_evidence_content_labels_sections():

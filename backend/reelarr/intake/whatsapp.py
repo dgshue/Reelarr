@@ -17,12 +17,22 @@ Evolution API integration shape:
 from __future__ import annotations
 
 import logging
+import re
 
 import httpx
 
-from reelarr.intake.base import ConfirmationCandidate, InboundLink, IntakeChannel, extract_supported_url
+from reelarr.intake.base import (
+    ConfirmationCandidate,
+    InboundLink,
+    IntakeChannel,
+    MultiSelectOption,
+    extract_supported_url,
+)
 
 logger = logging.getLogger(__name__)
+
+# Reply like "1,3,5" / "1 3 5" — indexes to add (multi-select fallback)
+_NUMBERED_REPLY = re.compile(r"^\s*\d+(?:[\s,]+\d+)*\s*$")
 
 
 class WhatsAppChannel(IntakeChannel):
@@ -43,6 +53,10 @@ class WhatsAppChannel(IntakeChannel):
         self._client: httpx.AsyncClient | None = None
         # Pending numbered-reply confirmations: chat_ref -> request_id
         self._pending: dict[str, int] = {}
+        # Pending multi-select prompts: chat_ref -> (request_id, option count,
+        # awaiting "yes" for add-all). Only the *prompt routing* lives here —
+        # selection state itself persists on the request row (spec §5.4).
+        self._pending_multi: dict[str, tuple[int, int, bool]] = {}
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -102,6 +116,12 @@ class WhatsAppChannel(IntakeChannel):
             or ""
         )
 
+        # Numbered-reply multi-select path ("1,3,5" / "all" / "0")
+        if number in self._pending_multi and self._multi_select_handler is not None:
+            handled = await self._handle_multi_reply(number, text.strip())
+            if handled:
+                return
+
         # Numbered-reply confirmation path
         if number in self._pending and text.strip().isdigit():
             request_id = self._pending.pop(number)
@@ -124,6 +144,43 @@ class WhatsAppChannel(IntakeChannel):
                     raw_text=text,
                 )
             )
+
+    async def _handle_multi_reply(self, number: str, text: str) -> bool:
+        """Interpret a reply to a pending multi-select prompt. Returns True if
+        the message was consumed as a multi-select interaction."""
+        assert self._multi_select_handler is not None
+        request_id, count, awaiting_yes = self._pending_multi[number]
+        lowered = text.lower()
+
+        if awaiting_yes:
+            self._pending_multi.pop(number)
+            if lowered in ("yes", "y"):
+                await self._multi_select_handler(request_id, "confirm_all", None, number, None)
+            else:
+                await self.send_text(number, "Cancelled — nothing was added.")
+            return True
+
+        if lowered == "0":
+            self._pending_multi.pop(number)
+            await self._multi_select_handler(request_id, "none", None, number, None)
+            return True
+        if lowered == "all":
+            # "Add all" re-prompts before firing (spec §5.4)
+            self._pending_multi[number] = (request_id, count, True)
+            await self.send_text(
+                number, f"That will add all {count} titles — reply 'yes' to confirm, or 0 to cancel."
+            )
+            return True
+        if _NUMBERED_REPLY.match(text):
+            indexes = sorted({int(tok) for tok in re.split(r"[\s,]+", text) if tok})
+            if all(1 <= i <= count for i in indexes):
+                self._pending_multi.pop(number)
+                await self._multi_select_handler(request_id, "replace", indexes, number, None)
+                await self._multi_select_handler(request_id, "confirm", None, number, None)
+            else:
+                await self.send_text(number, f"Pick numbers between 1 and {count}, 'all', or 0.")
+            return True
+        return False  # not a selection reply — fall through (may be a new link)
 
     # --- outbound ------------------------------------------------------------
 
@@ -149,3 +206,24 @@ class WhatsAppChannel(IntakeChannel):
         if candidates:
             self._pending[chat_ref] = candidates[0].request_id
         await self.send_text(chat_ref, "\n".join(lines))
+
+    async def send_multi_select(
+        self, chat_ref: str, prompt: str, options: list[MultiSelectOption]
+    ) -> str | None:
+        """Numbered-reply fallback (spec §5.4) — reply "1,3,5", "all", or 0."""
+        lines = [prompt, ""]
+        for o in options:
+            lines.append(f"{o.index}. {o.label}")
+        lines.append("")
+        lines.append("Reply with the numbers to add (e.g. 1,3,5), 'all' for all, or 0 for none.")
+        if options:
+            self._pending_multi[chat_ref] = (options[0].request_id, len(options), False)
+        await self.send_text(chat_ref, "\n".join(lines))
+        return None  # Evolution send API: no message ref we can edit anyway
+
+    async def update_multi_select(
+        self, chat_ref: str, message_ref: str | None, options: list[MultiSelectOption],
+        confirm_all: bool = False,
+    ) -> None:
+        """No in-place editing on WhatsApp — selection arrives whole in one
+        numbered reply, so there is nothing to re-render."""

@@ -98,6 +98,9 @@ class AppConfig(BaseSettings):
     # frame at 512px vs ~2000 at full resolution (which overflows Ollama's
     # default 4096 context). Subtitles stay legible at 512.
     frame_width: int = 512
+    # Multi-title cap (spec §5.4): a "top 50" post can't dump 50 adds into
+    # Radarr. Truncation is always surfaced to the user, never silent.
+    max_multi_titles: int = 10
 
     @property
     def sqlalchemy_url(self) -> str:

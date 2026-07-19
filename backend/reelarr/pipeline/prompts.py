@@ -57,6 +57,89 @@ ACTOR_RECOGNITION_SYSTEM_PROMPT = (
 
 ACTOR_RECOGNITION_USER_PROMPT = "Which well-known actors do these people resemble?"
 
+# --- Multi-title (listicle / versus) prompt (spec §5.4) ------------------------
+# A large share of film content is countdowns ("top 10 horror films"), lists
+# ("5 mind-bending movies: ..."), or versus posts. The single-title contract
+# returns null/low on those (measured, 2026-07-18). This prompt classifies the
+# *post type* first — the critical subtlety is separating "several films are
+# the subject" (listicle) from "several films are merely mentioned" (a
+# single-subject post whose comments name comparisons), which must keep
+# resolving to the one subject.
+
+MULTI_TITLE_SYSTEM_PROMPT = (
+    "You analyze a social media video post about movies or TV shows. "
+    "First classify the post:\n"
+    '- "single": the post is about ONE title. Other titles mentioned in '
+    "comments or as comparisons are NOT subjects.\n"
+    '- "listicle": a ranking, countdown, or list ("top 10 ...", "5 movies '
+    'that ...") where several titles are each a subject.\n'
+    '- "versus": two or more titles compared head-to-head.\n'
+    'Respond ONLY with JSON: { "post_type": "single"|"listicle"|"versus"|"unknown", '
+    '"stated_count": number|null, "titles": [ { "title": string, '
+    '"year": number|null, "type": "movie"|"tv"|null, '
+    '"confidence": "high"|"medium"|"low" } ] }. '
+    'stated_count: how many titles the caption itself claims (10 for "top 10"), '
+    "null if it does not say. titles: every title that is a SUBJECT of the "
+    'post, best first — exactly one for "single", each compared title for '
+    '"versus". Only include titles actually named or clearly identifiable from '
+    "the material. NEVER invent or pad titles to reach stated_count — fewer "
+    "correct titles is better than a padded list. Ignore hashtag spam like "
+    "#fyp #movie #film."
+)
+
+_VALID_POST_TYPES = {"single", "listicle", "versus", "unknown"}
+
+# Caption-count prior (spec §5.4: "use the caption's own stated count").
+# Word-numbers cover "five movies you need to watch"-style captions.
+_WORD_NUMBERS = {
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "twenty": 20,
+}
+_NUM = r"(\d{1,3}|" + "|".join(_WORD_NUMBERS) + r")"
+_LISTICLE_PATTERNS = [
+    # "top 10 horror films", "my top5"
+    re.compile(rf"\btop\s{{0,3}}{_NUM}\b", re.IGNORECASE),
+    # "5 mind-bending movies", "five underrated sci-fi films"
+    re.compile(
+        rf"\b{_NUM}\s+(?:[\w'-]+\s+){{0,3}}?(?:movies|films|shows|series)\b",
+        re.IGNORECASE,
+    ),
+    # "ranking every A24 horror movie", "ranked worst to best"
+    re.compile(r"\brank(?:ing|ed)\b", re.IGNORECASE),
+    re.compile(r"\bcountdown\b", re.IGNORECASE),
+]
+_VERSUS_PATTERN = re.compile(r"\bvs\.?\b|\bversus\b", re.IGNORECASE)
+
+
+def detect_listicle_signal(text: str | None) -> tuple[bool, int | None]:
+    """Cheap regex prior over the caption: (looks multi-title, stated count).
+
+    Deliberately conservative — a miss only costs the fast path (the pipeline
+    still attempts multi-title extraction as a last resort before giving up),
+    while a false positive costs one extra LLM call whose "single"
+    classification falls back to the normal flow. Plain single-subject
+    captions ("This scene from Heat is unmatched") must not trigger.
+    """
+    if not text:
+        return False, None
+    count: int | None = None
+    hinted = False
+    for pattern in _LISTICLE_PATTERNS:
+        m = pattern.search(text)
+        if not m:
+            continue
+        hinted = True
+        if m.groups() and m.group(1) and count is None:
+            token = m.group(1).lower()
+            count = int(token) if token.isdigit() else _WORD_NUMBERS.get(token)
+    if _VERSUS_PATTERN.search(text):
+        hinted = True
+    if count is not None and not (2 <= count <= 100):
+        count = None  # "1 movie" / absurd numbers: no useful prior
+    return hinted, count
+
+
 EVIDENCE_IDENTIFICATION_SYSTEM_PROMPT = (
     "You identify which movie or TV show a social media video clip is from, "
     "using evidence gathered from the clip: caption, top comments, audio "
@@ -255,3 +338,80 @@ def parse_evidence_identification(raw: str) -> tuple[list[Identification], list[
                     character_names.append(cleaned)
 
     return candidates[:3], character_names
+
+
+# --- Multi-title extraction (spec §5.4) ----------------------------------------
+
+
+@dataclass
+class MultiTitleExtraction:
+    post_type: str  # "single" | "listicle" | "versus" | "unknown"
+    stated_count: int | None
+    titles: list[Identification]  # best first, unknowns dropped
+
+
+def no_titles() -> MultiTitleExtraction:
+    """Fresh empty extraction (not a shared singleton — the list is mutable)."""
+    return MultiTitleExtraction(post_type="unknown", stated_count=None, titles=[])
+
+
+def build_multi_title_content(
+    *,
+    caption: str | None = None,
+    hashtags: list[str] | None = None,
+    top_comments: list[str] | None = None,
+    transcript: str | None = None,
+    stated_count: int | None = None,
+) -> str:
+    """Same labeled sections as the single-title call, plus the caption-count
+    prior as an explicit expectation the model is told not to pad toward."""
+    content = build_user_content(
+        caption=caption,
+        hashtags=hashtags,
+        top_comments=top_comments,
+        transcript=transcript,
+    )
+    if stated_count is not None:
+        content += (
+            f"\n\nNOTE: the caption claims this post covers {stated_count} titles. "
+            "If you can identify fewer, that is fine — do not invent titles to "
+            "reach the count."
+        )
+    return content
+
+
+def parse_multi_title_extraction(raw: str) -> MultiTitleExtraction:
+    """Defensive parse of the multi-title call. Falls back to an empty
+    extraction on garbage — the pipeline then continues the single-title flow."""
+    data = _extract_json(raw)
+    if not data:
+        return no_titles()
+
+    post_type = data.get("post_type")
+    if post_type not in _VALID_POST_TYPES:
+        post_type = "unknown"
+
+    stated_count = data.get("stated_count")
+    if isinstance(stated_count, str) and stated_count.isdigit():
+        stated_count = int(stated_count)
+    if not isinstance(stated_count, int) or not (2 <= stated_count <= 100):
+        stated_count = None
+
+    titles: list[Identification] = []
+    seen: set[tuple[str, int | None]] = set()
+    raw_titles = data.get("titles")
+    if isinstance(raw_titles, list):
+        for entry in raw_titles[:25]:  # sanity bound before the pipeline's cap
+            if not isinstance(entry, dict):
+                continue
+            ident = parse_identification(json.dumps(entry))
+            if ident.is_unknown:
+                continue
+            assert ident.title is not None
+            key = (ident.title.strip().lower(), ident.year)
+            if key in seen:
+                continue
+            seen.add(key)
+            titles.append(ident)
+
+    return MultiTitleExtraction(post_type=post_type, stated_count=stated_count, titles=titles)

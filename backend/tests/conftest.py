@@ -115,17 +115,21 @@ class FakeTmdb:
         person_ids: dict[str, int] | None = None,
         person_credits: dict[int, list] | None = None,  # person_id -> [PersonCredit]
         cast_characters: dict[tuple[str, int], list[str]] | None = None,
+        matches_by_query: dict[str, list] | None = None,  # multi-title tests
     ) -> None:
         self.matches = matches or []
         self.tvdb_ids = tvdb_ids or {}
         self.person_ids = person_ids or {}
         self.person_credits = person_credits or {}
         self.cast_characters = cast_characters or {}
+        self.matches_by_query = matches_by_query
         self.searches: list[tuple[str, int | None]] = []
         self.credit_lookups: list[tuple[str, int]] = []
 
     async def search_multi(self, query: str, year: int | None = None):
         self.searches.append((query, year))
+        if self.matches_by_query is not None:
+            return list(self.matches_by_query.get(query, []))
         return list(self.matches)
 
     async def resolve_tvdb_id(self, tmdb_id: int) -> int | None:

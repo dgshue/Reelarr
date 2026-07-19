@@ -41,18 +41,28 @@ from reelarr.pipeline.prompts import (
     FRAME_DESCRIBE_SYSTEM_PROMPT,
     FRAME_DESCRIBE_USER_PROMPT,
     IDENTIFICATION_SYSTEM_PROMPT,
+    MULTI_TITLE_SYSTEM_PROMPT,
     Identification,
+    MultiTitleExtraction,
     build_evidence_content,
+    build_multi_title_content,
     build_user_content,
+    detect_listicle_signal,
+    no_titles,
     parse_actor_guesses,
     parse_evidence_identification,
     parse_identification,
+    parse_multi_title_extraction,
 )
 from reelarr.pipeline.tmdb import PersonCredit, TmdbClient, TmdbMatch
 
 logger = logging.getLogger(__name__)
 
 MAX_CANDIDATES = 3
+
+# Multi-title cap (spec §5.4): a "top 50" post must not dump 50 adds into
+# Radarr. Truncation is surfaced to the user, never silent (spec §1).
+MAX_MULTI_TITLES = 10
 
 # --- Tier 3 tuning ------------------------------------------------------------
 VISION_FRAMES_PER_CALL = 3   # ~1000 tokens/frame at 512px; 3 fits a 4096 ctx
@@ -65,7 +75,17 @@ VERIFIED_MIN_HITS = 2        # character-name hits for "verified" (high)
 class PipelineOutcome(str, enum.Enum):
     AUTO_ADD = "auto_add"                  # high confidence + single exact match
     NEEDS_CONFIRMATION = "needs_confirmation"  # show top-3 + "None of these"
+    NEEDS_MULTI_SELECT = "needs_multi_select"  # listicle/versus — offer N titles
     UNIDENTIFIED = "unidentified"          # nothing usable — ask user for the title
+
+
+@dataclass
+class MultiTitleCandidate:
+    """One resolved title in a multi-select offer. Confidence is per-title
+    (spec §5.4: 8 certain + 2 guesses must surface that, not flatten it)."""
+
+    match: TmdbMatch
+    confidence: str  # "high" | "medium" | "low"
 
 
 @dataclass
@@ -77,6 +97,12 @@ class PipelineResult:
     candidates: list[TmdbMatch] = field(default_factory=list)  # populated for CONFIRM
     metadata: ClipMetadata | None = None
     transcript: str | None = None
+    # --- multi-title (NEEDS_MULTI_SELECT) fields (spec §5.4) ----------------
+    multi_candidates: list[MultiTitleCandidate] = field(default_factory=list)
+    post_type: str | None = None       # "listicle" | "versus" | ...
+    stated_count: int | None = None    # the caption's own claimed count
+    unresolved_titles: list[str] = field(default_factory=list)  # no TMDB match
+    truncated: bool = False            # capped at max_multi_titles
 
 
 class IdentificationPipeline:
@@ -89,6 +115,7 @@ class IdentificationPipeline:
         vision_llm: VisionLLMClient | None = None,
         enable_vision: bool = False,
         frame_count: int = 4,
+        max_multi_titles: int = MAX_MULTI_TITLES,
     ) -> None:
         self.resolver = resolver
         self.text_llm = text_llm
@@ -97,6 +124,7 @@ class IdentificationPipeline:
         self.vision_llm = vision_llm
         self.enable_vision = enable_vision
         self.frame_count = frame_count
+        self.max_multi_titles = max_multi_titles
 
     async def run(self, url: str) -> PipelineResult:
         try:
@@ -115,6 +143,35 @@ class IdentificationPipeline:
         tier = "metadata"
         transcript: str | None = None
 
+        # Multi-title prior (spec §5.4): a caption that reads like a listicle
+        # ("top 10 ...", "5 movies ...") or a versus post gets a dedicated
+        # extraction pass. Hint-free captions keep today's single-title path
+        # untouched — the proven Heat-with-distractors behavior must not
+        # change, so the multi call is *additive*, never a replacement.
+        caption = metadata.description or metadata.title
+        hinted, stated_count = detect_listicle_signal(caption)
+        if hinted:
+            extraction = await self._extract_multi(metadata, None, stated_count)
+            multi_result = await self._resolve_multi(
+                extraction, stated_count, tier, metadata, None
+            )
+            if multi_result is not None:
+                return multi_result
+            # No multi offer (post classified single-subject, or <2 titles
+            # survived TMDB lookup) — fall back to the normal flow, letting
+            # the best extracted title improve on a blank tier-1 result.
+            if extraction.titles:
+                fallback = extraction.titles[0]
+                if len(extraction.titles) > 1 and fallback.confidence == "high":
+                    # Several subjects, but no multi-select could be built:
+                    # offering just one must go through confirmation — never
+                    # silently auto-add a fraction of a listicle.
+                    fallback = Identification(
+                        fallback.title, fallback.year, fallback.media_type, "medium"
+                    )
+                if self._better(fallback, ident):
+                    ident = fallback
+
         # --- Step 2: Tier 2 — transcript ----------------------------------
         if ident.is_unknown or ident.confidence != "high":
             try:
@@ -127,8 +184,20 @@ class IdentificationPipeline:
                 tier2 = await self._identify_from_text(metadata=metadata, transcript=transcript)
                 if self._better(tier2, ident):
                     ident, tier = tier2, "transcript"
+                if hinted:
+                    # Countdown voiceovers name the titles the caption only
+                    # counts ("top 10 ..." + narration) — retry with transcript.
+                    extraction = await self._extract_multi(metadata, transcript, stated_count)
+                    multi_result = await self._resolve_multi(
+                        extraction, stated_count, "transcript", metadata, transcript
+                    )
+                    if multi_result is not None:
+                        return multi_result
 
         # --- Step 3: Tier 3 — frames (feature-flagged) ---------------------
+        # TODO(vision-multi): a "top 10" slideshow with no caption/audio is
+        # where OCR of on-screen title cards would shine — feeding Tier 3's
+        # frame descriptions into _extract_multi is the natural seam.
         verified_match: TmdbMatch | None = None
         if (ident.is_unknown or ident.confidence != "high") and self.enable_vision and self.vision_llm:
             try:
@@ -140,6 +209,17 @@ class IdentificationPipeline:
                 logger.warning("tier 3 (frames) failed for %s", url, exc_info=True)
 
         if ident.is_unknown:
+            # Last-chance multi-title pass for lists the caption regex missed
+            # ("movies that will mess with your mind: ..."). Only when nothing
+            # was hinted (the hinted path already tried) and only from a dead
+            # end, so it can never displace a single-title identification.
+            if not hinted:
+                extraction = await self._extract_multi(metadata, transcript, None)
+                multi_result = await self._resolve_multi(
+                    extraction, extraction.stated_count, tier, metadata, transcript
+                )
+                if multi_result is not None:
+                    return multi_result
             return PipelineResult(
                 outcome=PipelineOutcome.UNIDENTIFIED,
                 identification=ident,
@@ -216,6 +296,112 @@ class IdentificationPipeline:
             ),
         )
         return parse_identification(raw)
+
+    # --- Multi-title (listicle / versus) extraction (spec §5.4) --------------
+
+    async def _extract_multi(
+        self,
+        metadata: ClipMetadata,
+        transcript: str | None,
+        stated_count: int | None,
+    ) -> MultiTitleExtraction:
+        """The multi pass is additive to the proven single-title flow, so its
+        failures (LLM timeout on ambiguous input, garbage output) degrade to
+        'no titles' and the normal flow continues — never a dead pipeline."""
+        try:
+            raw = await self.text_llm.complete(
+                MULTI_TITLE_SYSTEM_PROMPT,
+                build_multi_title_content(
+                    caption=metadata.description or metadata.title,
+                    hashtags=metadata.hashtags,
+                    top_comments=metadata.top_comments,
+                    transcript=transcript,
+                    stated_count=stated_count,
+                ),
+            )
+        except Exception:
+            logger.warning("multi-title extraction failed", exc_info=True)
+            return no_titles()
+        return parse_multi_title_extraction(raw)
+
+    async def _resolve_multi(
+        self,
+        extraction: MultiTitleExtraction,
+        stated_count: int | None,
+        tier: str,
+        metadata: ClipMetadata,
+        transcript: str | None,
+    ) -> PipelineResult | None:
+        """TMDB-resolve a multi-title extraction into a NEEDS_MULTI_SELECT
+        result, or None if it isn't genuinely multi-title (post classified as
+        single-subject, or fewer than 2 titles survive TMDB lookup) — the
+        caller then continues the normal single-title flow. Multi results
+        NEVER auto-add; every title goes through user selection."""
+        if extraction.post_type == "single" or len(extraction.titles) < 2:
+            return None
+
+        titles = extraction.titles
+        truncated = len(titles) > self.max_multi_titles
+        titles = titles[: self.max_multi_titles]
+
+        resolved: list[MultiTitleCandidate] = []
+        unresolved: list[str] = []
+        seen: set[tuple[str, int]] = set()
+        for t in titles:
+            assert t.title is not None
+            try:
+                matches = await self.tmdb.search_multi(t.title, year=t.year)
+            except Exception:
+                logger.warning("multi-title TMDB search failed for %s", t.title, exc_info=True)
+                unresolved.append(t.title)
+                continue
+            if t.media_type:
+                typed = [m for m in matches if m.media_type == t.media_type]
+                matches = typed or matches
+            if not matches:
+                unresolved.append(t.title)
+                continue
+            match = matches[0]
+            key = (match.media_type, match.tmdb_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            # Per-title confidence: the LLM's own rating, demoted when the top
+            # TMDB hit isn't an exact title match (a fuzzy hit is a guess).
+            confidence = t.confidence
+            if confidence == "high" and not self._is_exact_match(t, match):
+                confidence = "medium"
+            resolved.append(MultiTitleCandidate(match=match, confidence=confidence))
+
+        if len(resolved) < 2:
+            return None
+
+        for item in resolved:
+            m = item.match
+            if m.media_type == "tv" and m.tvdb_id is None:
+                try:
+                    m.tvdb_id = await self.tmdb.resolve_tvdb_id(m.tmdb_id)
+                except Exception:
+                    logger.warning("tvdb resolution failed for tmdb:%s", m.tmdb_id, exc_info=True)
+
+        logger.info(
+            "multi-title (%s): %d resolved, %d unresolved, stated=%s, truncated=%s",
+            extraction.post_type, len(resolved), len(unresolved),
+            stated_count or extraction.stated_count, truncated,
+        )
+        return PipelineResult(
+            outcome=PipelineOutcome.NEEDS_MULTI_SELECT,
+            resolved_tier=tier,
+            metadata=metadata,
+            transcript=transcript,
+            multi_candidates=resolved,
+            post_type=extraction.post_type,
+            # Regex prior wins over the LLM's claim — it read the caption
+            # mechanically; the model sometimes rounds ("about ten").
+            stated_count=stated_count or extraction.stated_count,
+            unresolved_titles=unresolved,
+            truncated=truncated,
+        )
 
     # --- Tier 3: vision evidence + TMDB verification -------------------------
 

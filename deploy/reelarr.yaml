@@ -56,6 +56,8 @@ services:
       - ENABLE_VISION=${ENABLE_VISION:-false}
       - FRAME_COUNT=${FRAME_COUNT:-6}
       - FRAME_WIDTH=${FRAME_WIDTH:-512}
+      # Multi-title (listicle) cap — spec §5.4
+      - MAX_MULTI_TITLES=${MAX_MULTI_TITLES:-10}
       - OLLAMA_URL=http://ollama-nvidia:11434
       # --- Metadata ---
       - TMDB_API_KEY=${TMDB_API_KEY}

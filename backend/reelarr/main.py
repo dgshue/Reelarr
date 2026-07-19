@@ -102,6 +102,7 @@ def _build_processor(cfg) -> tuple[RequestProcessor | None, dict[str, IntakeChan
         vision_llm=vision_llm,
         enable_vision=cfg.enable_vision,
         frame_count=cfg.frame_count,
+        max_multi_titles=cfg.max_multi_titles,
     )
 
     if cfg.fulfillment_target == "seerr":
@@ -129,6 +130,7 @@ def _build_processor(cfg) -> tuple[RequestProcessor | None, dict[str, IntakeChan
     for channel in channels.values():
         channel.on_link(processor.handle_link)
         channel.on_confirmation(processor.handle_confirmation)
+        channel.on_multi_select(processor.handle_multi_select)
     return processor, channels
 
 

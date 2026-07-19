@@ -5,6 +5,12 @@ Telegram (or Discord / Slack / WhatsApp) → AI identifies the movie/show → ad
 Sonarr, or routes it through Overseerr/Jellyseerr for approval. Low confidence → the bot asks you to
 confirm on whichever channel the link came from.
 
+Listicles work too: a "top 10 horror films" countdown or a "Blade Runner vs 2049" versus post
+becomes a multi-select prompt — tap the titles you want (☐ → ☑), then **Add selected**. The bot
+says plainly when it identified fewer titles than the post claims, and never adds anything from a
+multi-title post without your selection. Offers are capped (default 10, `MAX_MULTI_TITLES`) so a
+"top 50" post can't flood Radarr — truncation is stated, never silent.
+
 Runs entirely on local AI (Ollama + faster-whisper via a LiteLLM proxy) — zero paid APIs required.
 Commercial providers (Groq, Gemini) are optional per-component drop-ins.
 
